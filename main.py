@@ -441,6 +441,58 @@ class GroupAdminPlugin(Star):
         """是否具备插件管理权限：仅 QQ 群管理员 + QQ 群主。"""
         return self._is_group_admin_or_owner(raw)
 
+    def _is_bot_owner(self, event) -> bool:
+        """#250：发送者是否为 AstrBot 主人（WebUI admins_id 配置的管理员）。
+
+        优先用框架在唤醒阶段写好的 event.role（admins_id 命中即 "admin"），
+        回退到直接比对 admins_id 配置，避免个别入口未赋 role 时漏判。
+        """
+        try:
+            sender_id = str(event.get_sender_id() or "")
+        except Exception:
+            sender_id = ""
+        if not sender_id:
+            return False
+        try:
+            if event.is_admin():
+                return True
+        except Exception:
+            pass
+        try:
+            admins = None
+            cfg = getattr(self.context, "astrbot_config", None)
+            if isinstance(cfg, dict):
+                admins = cfg.get("admins_id")
+            if admins is None:
+                get_cfg = getattr(self.context, "get_config", None)
+                if callable(get_cfg):
+                    admins = get_cfg().get("admins_id")
+            return sender_id in [str(x) for x in (admins or [])]
+        except Exception:
+            return False
+
+    async def _owner_may_recall_quoted(self, event, reply_id: str) -> bool:
+        """#250：bot 主人未任群管时，是否允许撤回被引用消息。
+
+        仅放宽到「引用撤回 bot 自身消息」：通过 get_msg 校验被引用消息的发送者
+        是 bot 自己；拿不到被引用消息（个别实现不支持 get_msg）时放行，
+        delete_msg 的最终权限由协议端校验（bot 非管理员时撤他人消息本就会失败）。
+        """
+        if not self._is_bot_owner(event):
+            return False
+        quoted = await self._execute_action(event, "get_msg",
+                                            message_id=str(reply_id), return_raw=True)
+        qdata = None
+        if isinstance(quoted, dict):
+            qdata = quoted.get("data") if isinstance(quoted.get("data"), dict) else quoted
+        sender = (qdata or {}).get("sender") or {}
+        q_sender = str(sender.get("user_id", "") or "")
+        self_id = self._get_self_id(event) or ""
+        if q_sender and self_id:
+            return q_sender == self_id
+        logger.debug("[撤回] bot 主人引用撤回：无法确认被引用消息发送者，交由协议端校验")
+        return True
+
     def get_group_setting(self, group_id: str, key: str, default=None):
         """按群读取配置项，先查 group_overrides[群号][key]，否则用全局配置/默认值。"""
         overrides = self._runtime_map("group_overrides").get(str(group_id), {})
@@ -883,6 +935,56 @@ class GroupAdminPlugin(Star):
 
     # ===================== OneBot API 封装 =====================
 
+    @staticmethod
+    def _normalize_member_list(result):
+        """把 get_group_member_list 的返回规整为成员 dict 列表；拿不到列表返回 None。
+
+        #256：aiocqhttp 的 call_action 成功时直接返回 data 本身（即成员列表），
+        部分框架再包一层 {data: [...]}；失败响应是含 status/retcode 的 dict 但没有
+        data 列表。旧实现只认 dict 形态，列表形态会被误判为「无被禁言成员」。
+        """
+        if isinstance(result, list):
+            return [m for m in result if isinstance(m, dict)]
+        if isinstance(result, dict):
+            data = result.get("data")
+            if isinstance(data, list):
+                return [m for m in data if isinstance(m, dict)]
+        return None
+
+    @staticmethod
+    def _member_mute_remaining(m: dict) -> int:
+        """读取单个成员的剩余禁言秒数（0=未禁言）。
+
+        #256：不同 OneBot 实现字段不同——OneBot v11 标准成员对象用
+        shut_up_timestamp（禁言到期 Unix 时间戳，0=未禁言），部分实现给
+        mute_left 等剩余秒数，另有 ban_end_time / mute_end_time / mute_until
+        等到期时间戳变体。旧实现只认 mute_left，导致多数协议端恒判「无人被禁言」。
+        """
+        now = int(time.time())
+        for key in ("mute_left", "mute_time_remaining", "ban_left"):
+            try:
+                v = float(m.get(key))
+            except (TypeError, ValueError):
+                continue
+            if v > 0:
+                return int(v)
+        for key in ("shut_up_timestamp", "ban_end_time", "mute_end_time", "mute_until"):
+            try:
+                v = float(m.get(key))
+            except (TypeError, ValueError):
+                continue
+            if v <= 0:
+                continue
+            if v >= 1_000_000_000:
+                # 到期时间戳语义
+                remaining = int(v) - now
+                if remaining > 0:
+                    return remaining
+            else:
+                # 个别实现给的是剩余秒数而非时间戳
+                return int(v)
+        return 0
+
     async def _recall_message(self, event: AstrMessageEvent, message_id: str):
         """撤回消息。OneBot 标准 API 名为 delete_msg。"""
         return await self._execute_action(event, "delete_msg", message_id=message_id)
@@ -1058,7 +1160,7 @@ class GroupAdminPlugin(Star):
         "添加黑名单", "删除黑名单", "查看黑名单",
         "设管理", "取消管理", "头衔",
         "别人昵称", "改群昵称", "群昵称", "群友昵称", "自己昵称", "设群友昵称", "禁言", "禁言列表", "解禁", "踢", "清用户历史", "鞭尸",
-        "设精", "取消设精", "改群头像", "宵禁", "解除宵禁", "禁我",
+        "设精", "取消设精", "改群头像", "设群头像", "设置群头像", "宵禁", "解除宵禁", "禁我",
         "发群公告", "排名", "清除数据", "举报", "status",
         "添加群待办", "取消群待办", "给我头衔", "加群申请待处理", "群信息", "群名称", "群名", "群标签", "群相册",
         "添加违禁图片", "删除违禁图片", "查看违禁图片",
@@ -1357,23 +1459,80 @@ class GroupAdminPlugin(Star):
         return await self._execute_action(event, "set_group_portrait",
                                           group_id=group_id, file=file)
 
-    async def _handle_group_request(self, event: AstrMessageEvent, flag: str, approve: bool, reason: str = ""):
+    async def _handle_group_request(self, event: AstrMessageEvent, flag: str, approve: bool,
+                                    reason: str = "", sub_type: str = "add") -> bool:
         """同意/拒绝加群申请，返回是否真正成功（#228）。
 
         OneBot v11 标准接口为 set_group_add_request（需 flag + sub_type + approve），
         旧实现只调用的 handle_group_request 并非标准 action；且调用方从不校验返回值，
         导致协议端拒绝后仍回复"已同意"。这里按顺序回退并返回真实结果。
+
+        #252：部分实现要求 sub_type 与申请事件一致（add/invite），改用申请事件
+        自带的 sub_type 而非硬编码 "add"；个别实现拒收 sub_type 参数，追加一次
+        不带 sub_type 的尝试；逐个记录真实失败原因，不再只报最后一个候选的
+        「不支持接口」，避免 flag 过期等真实原因被掩盖。
         """
         params = {"flag": flag, "approve": approve}
         if not approve and reason:
             params["reason"] = reason
-        ok, res = await self._call_action_fallback(
-            event, ("set_group_add_request", "handle_group_request"),
-            sub_type="add", **params)
-        if not ok:
-            logger.warning(f"[加群审核] 处理失败 flag={flag} approve={approve}: "
-                           f"{self._describe_action_failure(res, 'set_group_add_request')}")
-        return ok
+        attempts = []
+        candidates = (
+            ("set_group_add_request", {"sub_type": sub_type or "add"}),
+            ("set_group_add_request", {}),
+            ("handle_group_request", {}),
+        )
+        for action, extra in candidates:
+            p = dict(params)
+            p.update(extra)
+            res = await self._call_onebot_raw(event, action, **p)
+            if self._action_result_success(res):
+                return True
+            attempts.append(f"{action}{extra and list(extra.keys()) or ''}: "
+                            f"{self._describe_action_failure(res, action)}")
+        logger.warning(f"[加群审核] 处理失败 flag={flag} approve={approve}: "
+                       + "；".join(attempts))
+        return False
+
+    async def _match_pending_by_quote(self, event, group_id: str, reply_id: str,
+                                      pending: dict) -> dict:
+        """#258：被引用消息 ID 不在待处理表时的兜底定位。
+
+        拉取被引用消息原文，若确为插件发的【新人加群】通知，则按其中
+        「用户qq号：X」匹配同群待处理记录（多条例取最新一条）。被引用消息
+        拉取失败或内容不含通知特征时不兜底——避免把普通聊天里的「同意」
+        误处理成加群审核。
+        """
+        try:
+            quoted = await self._execute_action(event, "get_msg",
+                                                message_id=reply_id, return_raw=True)
+        except Exception as exc:
+            logger.debug(f"[加群审核] 兜底定位：get_msg 失败: {exc}")
+            return {}
+        qdata = None
+        if isinstance(quoted, dict):
+            qdata = quoted.get("data") if isinstance(quoted.get("data"), dict) else quoted
+        if not isinstance(qdata, dict):
+            return {}
+        parts = []
+        for seg in (qdata.get("message") or []):
+            if isinstance(seg, dict) and seg.get("type") == "text":
+                parts.append(str((seg.get("data") or {}).get("text", "")))
+        qtext = "".join(parts)
+        if "【新人加群】" not in qtext:
+            return {}
+        m = re.search(r"用户qq号[:：]\s*(\d{5,12})", qtext)
+        if not m:
+            return {}
+        uid = m.group(1)
+        matched = {}
+        for rec in pending.values():
+            if (isinstance(rec, dict) and str(rec.get("group_id")) == str(group_id)
+                    and str(rec.get("user_id")) == uid):
+                matched = rec  # dict 保序，后写入的覆盖为更新的一条
+        if matched:
+            logger.info(f"[加群审核] 引用消息 {reply_id} 不在待处理表，"
+                        f"已按通知内容定位到用户 {uid} 的待处理申请")
+        return matched
 
     # ===================== 消息收发辅助 =====================
 
@@ -1390,16 +1549,30 @@ class GroupAdminPlugin(Star):
         """查找群主 QQ 号，用于 #140 举报分级路由。返回 QQ 号字符串，找不到返回空串。"""
         member_list = await self._execute_action(event, "get_group_member_list",
                                                  group_id=group_id, return_raw=True)
-        if isinstance(member_list, dict):
-            data = member_list.get("data") or member_list
-            if isinstance(data, list):
-                for m in data:
-                    if isinstance(m, dict) and m.get("role") == "owner":
-                        return str(m.get("user_id", ""))
+        for m in self._normalize_member_list(member_list) or []:
+            if m.get("role") == "owner":
+                return str(m.get("user_id", ""))
         return ""
 
     async def _send_group_text(self, event: AstrMessageEvent, group_id: str, text: str):
-        """向指定群发送纯文本消息，返回 message_id（用于后续引用回复关联）。"""
+        """向指定群发送纯文本消息，返回 message_id（用于后续引用回复关联）。
+
+        #258：旧实现探测 self.context.send_group_msg——AstrBot Context 并不暴露
+        该 OneBot action，探测必然失败，实际总走 _send 兜底并返回空串，导致
+        加群申请通知的 message_id 记不进待处理表，管理员引用回复 /同意 时
+        永远查不到记录。这里改为优先走 OneBot send_group_msg（event.bot 直调），
+        从响应 data.message_id 拿真实消息 ID。
+        """
+        raw = await self._call_onebot_raw(event, "send_group_msg",
+                                          group_id=str(group_id), message=text)
+        if self._action_result_success(raw):
+            data = raw.get("data") if isinstance(raw, dict) else None
+            if isinstance(data, dict) and data.get("message_id"):
+                return str(data["message_id"])
+            if isinstance(data, (int, str)) and str(data):
+                return str(data)
+            # set 类 action 成功但没回 message_id：消息已发出，仍按空串处理
+            logger.warning("[加群审核] send_group_msg 成功但未返回 message_id")
         try:
             if hasattr(self.context, "send_group_msg"):
                 # AstrBot 标准方法：send_group_msg(group_id=, message=)
@@ -1408,25 +1581,37 @@ class GroupAdminPlugin(Star):
                 if isinstance(result, dict):
                     return str(result.get("message_id") or result.get("data", {}).get("message_id", ""))
                 return str(result) if result else ""
-            # 回退：使用 _send 但拿不到 message_id
-            await self._send(event, [Plain(text)])
         except Exception as e:
             logger.error(f"发送群消息失败: {e}")
+        # 回退：使用 _send 但拿不到 message_id
+        await self._send(event, [Plain(text)])
         return ""
+
+    async def _get_stranger_info(self, event: AstrMessageEvent, user_id: str) -> dict:
+        """通过 OneBot get_stranger_info 获取陌生用户资料（昵称/等级等），失败返回 {}。
+
+        #257：旧实现探测 self.context.get_stranger_info 属性——AstrBot Context
+        不暴露 OneBot action，探测必然失败，昵称静默回退成 QQ 号、QQ 等级恒为
+        「未知」。统一改走 _execute_action（event.bot.call_action 优先），并兼容
+        「裸 data」与「{data: {...}}」两种返回形态。
+        """
+        raw = await self._execute_action(event, "get_stranger_info",
+                                         user_id=str(user_id), return_raw=True)
+        info = None
+        if isinstance(raw, dict):
+            info = raw.get("data") if isinstance(raw.get("data"), dict) else raw
+        return info if isinstance(info, dict) else {}
 
     async def _get_user_nickname(self, event: AstrMessageEvent, user_id: str) -> str:
         """获取用户昵称（通过 OneBot get_stranger_info API）。"""
         try:
-            handler = getattr(self.context, "get_stranger_info", None)
-            if callable(handler):
-                info = await handler(user_id=int(user_id))
-                if isinstance(info, dict):
-                    return info.get("nickname") or info.get("data", {}).get("nickname", user_id)
-                if hasattr(info, "nickname"):
-                    return info.nickname
+            info = await self._get_stranger_info(event, user_id)
+            nick = str(info.get("nickname") or "").strip()
+            if nick:
+                return nick
         except Exception as e:
             logger.error(f"获取昵称失败: {e}")
-        return user_id
+        return str(user_id)
 
     async def _notify_admins(self, text: str, group_id: str = ""):
         """向 join_notify_admins 配置的管理员发送私聊通知。"""
@@ -3045,11 +3230,14 @@ class GroupAdminPlugin(Star):
             yield event.plain_result("此指令只能在群聊中使用")
             return
         group_id = str(raw.get("group_id"))
-        if not self._is_authorized(raw, str(raw.get("user_id", ""))):
-            yield event.plain_result("只有群管理员或群主可执行此操作")
-            return
-
         reply_id = self._get_reply_id(event)
+        if not self._is_authorized(raw, str(raw.get("user_id", ""))):
+            # #250：bot 主人（AstrBot admins_id）未任群管时，仅放宽「引用撤回
+            # bot 自身消息」这一条路径；其余撤回（@用户 N / N 条）仍需群管权限
+            if not (reply_id and await self._owner_may_recall_quoted(event, reply_id)):
+                yield event.plain_result("只有群管理员或群主可执行此操作（bot 主人可引用撤回 bot 自己的消息）")
+                return
+
         target_qq = self._extract_at_qq(raw)
         self_msg_id = str(raw.get("message_id", "")) if raw.get("message_id") else ""
         # 撤回成功提示：show_recall_notice 控制（全局或按群覆盖），关闭时成功静默；失败仍提示。
@@ -3270,8 +3458,10 @@ class GroupAdminPlugin(Star):
         ok = await self._delete_essence(event, reply_id, group_id=str(raw.get("group_id")))
         yield event.plain_result("取消设精成功" if ok else "取消设精失败")
 
-    # #24: 改群头像
-    @filter.command("改群头像", "引用图片回复即可修改群头像")
+    # #24: 改群头像；#251：补「设群头像/设置群头像」别名，防止未注册指令被
+    # AstrBot 核心 LLM 兜底接管（报「未找到任何可用的对话模型」）
+    @filter.command("改群头像", "引用图片回复即可修改群头像",
+                    alias={"设群头像", "设置群头像"})
     async def set_group_avatar_cmd(self, event: AstrMessageEvent):
         raw = self._get_raw_message(event)
         if not raw or not raw.get("group_id"):
@@ -3490,21 +3680,22 @@ class GroupAdminPlugin(Star):
         group_id = str(raw.get("group_id"))
         member_list = await self._execute_action(event, "get_group_member_list",
                                                   group_id=group_id, return_raw=True)
+        members = self._normalize_member_list(member_list)
+        if members is None:
+            yield event.plain_result(
+                "获取群成员列表失败（当前 OneBot 实现可能不支持 get_group_member_list），"
+                "无法查询禁言列表")
+            return
         muted = []
-        if isinstance(member_list, dict):
-            data = member_list.get("data") or member_list
-            if isinstance(data, list):
-                for m in data:
-                    if not isinstance(m, dict):
-                        continue
-                    mute_left = m.get("mute_left", 0)
-                    if isinstance(mute_left, (int, float)) and mute_left > 0:
-                        uid = str(m.get("user_id", ""))
-                        nick = m.get("nickname", "")
-                        card = m.get("card", "") or ""
-                        name = card if card else nick
-                        minutes = max(1, int(mute_left / 60))
-                        muted.append(f"{uid}（{name}）剩余 {minutes} 分钟")
+        for m in members:
+            remaining = self._member_mute_remaining(m)
+            if remaining > 0:
+                uid = str(m.get("user_id", ""))
+                nick = m.get("nickname", "")
+                card = m.get("card", "") or ""
+                name = card if card else nick
+                minutes = max(1, remaining // 60)
+                muted.append(f"{uid}（{name}）剩余 {minutes} 分钟")
         if not muted:
             yield event.plain_result("本群当前无被禁言成员")
             return
@@ -3844,8 +4035,15 @@ class GroupAdminPlugin(Star):
             yield event.plain_result(f"已添加群标签「{text}」")
             return
         logger.warning(f"添加群标签失败: group={group_id} tag={text} result={result}")
-        yield event.plain_result(
-            f"添加群标签失败：{self._describe_action_failure(result, 'set_group_tag')}")
+        detail = self._describe_action_failure(result, 'set_group_tag')
+        # #249：set_group_tag 是 LLOneBot 等个别协议端的扩展接口，并非 OneBot v11
+        # 标准 action，go-cqhttp / NapCat / Lagrange 均未提供，无跨实现候选可回退；
+        # 失败时把这一点讲清楚，避免用户误以为是插件或权限问题
+        if ("不支持" in detail) or ("无可用调用通路" in detail):
+            detail += ("。set_group_tag 并非 OneBot v11 标准接口，仅部分协议端"
+                       "（如 LLOneBot）提供，当前协议端不支持且无替代接口；"
+                       "请更换/升级协议端，或在 QQ 客户端手动设置群标签")
+        yield event.plain_result(f"添加群标签失败：{detail}")
 
     # #162: /添加违禁图片 — 引用图片消息加入违禁图列表（群管/群主）
     @filter.command("添加违禁图片", "引用图片消息加入违禁图列表")
@@ -4620,7 +4818,10 @@ class GroupAdminPlugin(Star):
         has_permission = self._is_authorized(raw, user_id)
         if reply_id and has_permission:
             pending = self._runtime_map("pending_join_requests")
-            info = pending.get(str(reply_id))
+            # #258：通知消息 ID 没记进待处理表时，按被引用消息内容里的
+            # 「用户qq号」兜底定位同群待处理记录
+            info = pending.get(str(reply_id)) or self._match_pending_by_quote(
+                event, group_id, str(reply_id), pending)
             if info:
                 msg_text = self._extract_text(raw)
                 if msg_text:
@@ -4641,16 +4842,19 @@ class GroupAdminPlugin(Star):
                             reject_reason = custom if custom else self.get_group_setting(
                                 group_id, "join_reject_reason", "不满足加群条件") or "不满足加群条件"
                         # #228：接口调用失败时不能回复"已同意/已拒绝"
+                        # #252：sub_type 用申请事件原值，提高协议端兼容性
                         handled = await self._handle_group_request(
-                            event, info["flag"], approve, reject_reason)
+                            event, info["flag"], approve, reject_reason,
+                            sub_type=str(info.get("sub_type") or "add"))
                         result = "拉黑" if blacklist else ("同意" if approve else "拒绝")
                         if not handled:
                             yield event.plain_result(
                                 f"处理 {info['user_id']} 的加群申请失败（协议端拒绝或接口不可用，"
                                 f"详见日志），请稍后重试")
                             return
-                        # 清理已处理的记录
-                        del pending[str(reply_id)]
+                        # 清理已处理的记录（#258：兜底匹配可能存在同记录多键，全部清掉）
+                        for key in [k for k, v in pending.items() if v is info]:
+                            del pending[key]
                         self.save_config()
                         yield event.plain_result(f"已{result} {info['user_id']} 的加群申请")
                         return
@@ -4690,6 +4894,8 @@ class GroupAdminPlugin(Star):
             user_id = str(raw.get("user_id"))
             flag = raw.get("flag", "")
             comment = raw.get("comment", "")
+            # #252：sub_type 用申请事件原值（add/invite），部分实现要求与 flag 匹配
+            sub_type = str(raw.get("sub_type") or "add")
             # #155：审核总开关关闭后，全部自动审核逻辑都跳过
             audit_enabled = bool(self.get_group_setting(group_id, "join_audit_enabled", True))
             if not audit_enabled:
@@ -4715,7 +4921,7 @@ class GroupAdminPlugin(Star):
             # #194：黑名单用户直接拒绝（无需检查关键词/门禁）
             bl_list = self.get_group_setting(group_id, "blacklisted_users", [])
             if bl_list and str(user_id) in [str(x) for x in bl_list]:
-                handled = await self._handle_group_request(event, flag, False, "黑名单用户")
+                handled = await self._handle_group_request(event, flag, False, "黑名单用户", sub_type=sub_type)
                 yield event.plain_result(
                     f"已拒绝 {user_id} 的加群申请（黑名单用户）" if handled else
                     f"拒绝 {user_id} 的加群申请失败（协议端拒绝或接口不可用，详见日志）")
@@ -4733,7 +4939,7 @@ class GroupAdminPlugin(Star):
             reject_reason = self.get_group_setting(group_id, "join_reject_reason", "不满足加群条件") or "不满足加群条件"
             if enabled and violation_keywords and any(kw in comment for kw in violation_keywords):
                 detail_reason = f"您的加群申请有词触碰到本群违禁词，自动拒绝（{reject_reason}）"
-                handled = await self._handle_group_request(event, flag, False, detail_reason)
+                handled = await self._handle_group_request(event, flag, False, detail_reason, sub_type=sub_type)
                 yield event.plain_result(
                     f"已拒绝 {user_id} 的加群申请（含违禁词）" if handled else
                     f"拒绝 {user_id} 的加群申请失败（协议端拒绝或接口不可用，详见日志）")
@@ -4749,7 +4955,7 @@ class GroupAdminPlugin(Star):
 
             # 命中关键词：同意 + 通知管理员 + 群内通知（#186）
             if enabled and join_approve_keywords and any(kw in comment for kw in join_approve_keywords):
-                handled = await self._handle_group_request(event, flag, True, "命中关键词自动同意")
+                handled = await self._handle_group_request(event, flag, True, "命中关键词自动同意", sub_type=sub_type)
                 yield event.plain_result(
                     f"已同意 {user_id} 的加群申请（命中关键词）" if handled else
                     f"同意 {user_id} 的加群申请失败（协议端拒绝或接口不可用，详见日志）")
@@ -4773,37 +4979,49 @@ class GroupAdminPlugin(Star):
             # 群内提醒（#57）：发送申请消息到对应群聊，等待管理员引用回复同意/拒绝
             if self.get_group_setting(group_id, "join_request_notify_in_group", False):
                 nickname = await self._get_user_nickname(event, user_id)
-                # #189：补充 QQ 等级（get_stranger_info 的 level 字段，协议端不支持时显示未知）
-                level = ""
+                # #189/#257：QQ 等级走统一的 get_stranger_info 通路，
+                # 协议端不支持 level 字段时显示未知
+                level = "未知"
                 try:
-                    handler = getattr(self.context, "get_stranger_info", None)
-                    if callable(handler):
-                        info = await handler(user_id=int(user_id))
-                        info_data = info.get("data", info) if isinstance(info, dict) else {}
-                        level = str(info_data.get("level") or "未知")
+                    info = await self._get_stranger_info(event, user_id)
+                    level = str(info.get("level") or "").strip() or "未知"
                 except Exception:
                     level = "未知"
                 notify_text = (
                     f"【新人加群】通知\n"
                     f"用户qq昵称：{nickname}\n"
                     f"用户qq号：{user_id}\n"
-                    f"qq等级：{level or '未知'}\n"
+                    f"qq等级：{level}\n"
                     f"加群验证消息：{comment or '无'}\n"
                     f"回复 /同意 或 /拒绝 或 /拉黑（引用本消息）"
                 )
                 # 暂存 flag 等待引用回复
                 sent_id = await self._send_group_text(event, group_id, notify_text)
+                pending = self._runtime_map("pending_join_requests")
+                record = {"flag": flag, "group_id": group_id, "user_id": user_id,
+                          "sub_type": str(raw.get("sub_type") or "add"),
+                          "ts": int(time.time())}
+                # #258：顺带清理超过 7 天的陈旧待处理记录，防止 runtime.json 无限膨胀
+                stale = [k for k, v in pending.items()
+                         if isinstance(v, dict) and int(v.get("ts", 0) or 0) < int(time.time()) - 7 * 86400]
+                for k in stale:
+                    del pending[k]
                 if sent_id:
-                    pending = self._runtime_map("pending_join_requests")
-                    pending[str(sent_id)] = {"flag": flag, "group_id": group_id, "user_id": user_id}
-                    self.save_config()
-                    # #205：全局开关关闭时不发管理员通知
-                    if self.config.get("join_request_notify_enabled", True):
-                        await self._notify_admins(
-                            f"[加群请求] {user_id} 申请加入群 {group_id}\n"
-                            f"已在群内发送提醒，请管理员引用回复同意/拒绝",
-                            group_id=group_id,
-                        )
+                    pending[str(sent_id)] = record
+                else:
+                    # #258：拿不到通知消息 ID（协议端未回 message_id）时也要落记录，
+                    # 否则管理员引用通知回复 /同意 时无法定位该申请
+                    pending[f"flag:{flag}"] = record
+                    logger.warning("[加群审核] 未能获取申请通知的 message_id，"
+                                   "待处理记录改按 flag 暂存，引用回复时按内容兜底定位")
+                self.save_config()
+                # #205：全局开关关闭时不发管理员通知
+                if self.config.get("join_request_notify_enabled", True):
+                    await self._notify_admins(
+                        f"[加群请求] {user_id} 申请加入群 {group_id}\n"
+                        f"已在群内发送提醒，请管理员引用回复同意/拒绝",
+                        group_id=group_id,
+                    )
             else:
                 # #226：未开启群内提醒时，全局开关打开也必须通知管理员，
                 # 否则普通加群申请不会有任何通知（旧实现只在此 if 内发送）。

@@ -14,6 +14,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from astrbot.api import logger
+
 if TYPE_CHECKING:
     from .config_store import ConfigStore
     from .message_parse import MessageParser
@@ -40,6 +42,58 @@ class PermissionService:
     def _is_authorized(self, raw: dict, user_id: str = "") -> bool:
         """是否具备插件管理权限：仅 QQ 群管理员 + QQ 群主。"""
         return self._is_group_admin_or_owner(raw)
+
+    def _is_bot_owner(self, event) -> bool:
+        """#250：发送者是否为 AstrBot 主人（WebUI admins_id 配置的管理员）。
+
+        优先用框架在唤醒阶段写好的 event.role（admins_id 命中即 "admin"），
+        回退到直接比对 admins_id 配置，避免个别入口未赋 role 时漏判。
+        """
+        try:
+            sender_id = str(event.get_sender_id() or "")
+        except Exception:
+            sender_id = ""
+        if not sender_id:
+            return False
+        try:
+            if event.is_admin():
+                return True
+        except Exception:
+            pass
+        try:
+            admins = None
+            cfg = getattr(self._api.context, "astrbot_config", None)
+            if isinstance(cfg, dict):
+                admins = cfg.get("admins_id")
+            if admins is None:
+                get_cfg = getattr(self._api.context, "get_config", None)
+                if callable(get_cfg):
+                    admins = get_cfg().get("admins_id")
+            return sender_id in [str(x) for x in (admins or [])]
+        except Exception:
+            return False
+
+    async def _owner_may_recall_quoted(self, event, reply_id: str) -> bool:
+        """#250：bot 主人未任群管时，是否允许撤回被引用消息。
+
+        仅放宽到「引用撤回 bot 自身消息」：通过 get_msg 校验被引用消息的发送者
+        是 bot 自己；拿不到被引用消息（个别实现不支持 get_msg）时放行，
+        delete_msg 的最终权限由协议端校验（bot 非管理员时撤他人消息本就会失败）。
+        """
+        if not self._is_bot_owner(event):
+            return False
+        quoted = await self._api._execute_action(event, "get_msg",
+                                                 message_id=str(reply_id), return_raw=True)
+        qdata = None
+        if isinstance(quoted, dict):
+            qdata = quoted.get("data") if isinstance(quoted.get("data"), dict) else quoted
+        sender = (qdata or {}).get("sender") or {}
+        q_sender = str(sender.get("user_id", "") or "")
+        self_id = self._api._get_self_id(event) or ""
+        if q_sender and self_id:
+            return q_sender == self_id
+        logger.debug("[撤回] bot 主人引用撤回：无法确认被引用消息发送者，交由协议端校验")
+        return True
 
     def _is_group_owner(self, raw: dict) -> bool:
         role = raw.get("sender", {}).get("role", "")

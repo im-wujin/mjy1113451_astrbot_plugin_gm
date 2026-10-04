@@ -26,7 +26,10 @@ enabled_groups 语义（与 moderation 不同，逐字保留本处原语义）�
 
 from __future__ import annotations
 
+import time
 from typing import TYPE_CHECKING
+
+from astrbot.api import logger
 
 if TYPE_CHECKING:
     from .config_store import ConfigStore
@@ -72,6 +75,8 @@ class JoinReviewService:
         user_id = str(raw.get("user_id"))
         flag = raw.get("flag", "")
         comment = raw.get("comment", "")
+        # #252：sub_type 用申请事件原值（add/invite），部分实现要求与 flag 匹配
+        sub_type = str(raw.get("sub_type") or "add")
         # #155：审核总开关关闭后，全部自动审核逻辑都跳过
         audit_enabled = bool(self._store.get_group_setting(group_id, "join_audit_enabled", True))
         if not audit_enabled:
@@ -97,7 +102,8 @@ class JoinReviewService:
         # #194：黑名单用户直接拒绝（无需检查关键词/门禁）
         bl_list = self._store.get_group_setting(group_id, "blacklisted_users", [])
         if bl_list and str(user_id) in [str(x) for x in bl_list]:
-            handled = await self._api._handle_group_request(event, flag, False, "黑名单用户")
+            handled = await self._api._handle_group_request(
+                event, flag, False, "黑名单用户", sub_type=sub_type)
             yield event.plain_result(
                 f"已拒绝 {user_id} 的加群申请（黑名单用户）" if handled else
                 f"拒绝 {user_id} 的加群申请失败（协议端拒绝或接口不可用，详见日志）")
@@ -115,7 +121,8 @@ class JoinReviewService:
         reject_reason = self._store.get_group_setting(group_id, "join_reject_reason", "不满足加群条件") or "不满足加群条件"
         if enabled and violation_keywords and any(kw in comment for kw in violation_keywords):
             detail_reason = f"您的加群申请有词触碰到本群违禁词，自动拒绝（{reject_reason}）"
-            handled = await self._api._handle_group_request(event, flag, False, detail_reason)
+            handled = await self._api._handle_group_request(
+                event, flag, False, detail_reason, sub_type=sub_type)
             yield event.plain_result(
                 f"已拒绝 {user_id} 的加群申请（含违禁词）" if handled else
                 f"拒绝 {user_id} 的加群申请失败（协议端拒绝或接口不可用，详见日志）")
@@ -131,7 +138,8 @@ class JoinReviewService:
 
         # 命中关键词：同意 + 通知管理员 + 群内通知（#186）
         if enabled and join_approve_keywords and any(kw in comment for kw in join_approve_keywords):
-            handled = await self._api._handle_group_request(event, flag, True, "命中关键词自动同意")
+            handled = await self._api._handle_group_request(
+                event, flag, True, "命中关键词自动同意", sub_type=sub_type)
             yield event.plain_result(
                 f"已同意 {user_id} 的加群申请（命中关键词）" if handled else
                 f"同意 {user_id} 的加群申请失败（协议端拒绝或接口不可用，详见日志）")
@@ -169,17 +177,30 @@ class JoinReviewService:
             )
             # 暂存 flag 等待引用回复
             sent_id = await self._api._send_group_text(event, group_id, notify_text)
+            pending = self._store.runtime_map("pending_join_requests")
+            record = {"flag": flag, "group_id": group_id, "user_id": user_id,
+                      "sub_type": sub_type, "ts": int(time.time())}
+            # #258：顺带清理超过 7 天的陈旧待处理记录，防止 runtime.json 无限膨胀
+            stale = [k for k, v in pending.items()
+                     if isinstance(v, dict) and int(v.get("ts", 0) or 0) < int(time.time()) - 7 * 86400]
+            for k in stale:
+                del pending[k]
             if sent_id:
-                pending = self._store.runtime_map("pending_join_requests")
-                pending[str(sent_id)] = {"flag": flag, "group_id": group_id, "user_id": user_id}
-                self._store.save_config()
-                # #205：全局开关关闭时不发管理员通知
-                if self.config.get("join_request_notify_enabled", True):
-                    await self._api._notify_admins(
-                        f"[加群请求] {user_id} 申请加入群 {group_id}\n"
-                        f"已在群内发送提醒，请管理员引用回复同意/拒绝",
-                        group_id=group_id,
-                    )
+                pending[str(sent_id)] = record
+            else:
+                # #258：拿不到通知消息 ID（协议端未回 message_id）时也要落记录，
+                # 否则管理员引用通知回复 /同意 时无法定位该申请
+                pending[f"flag:{flag}"] = record
+                logger.warning("[加群审核] 未能获取申请通知的 message_id，"
+                               "待处理记录改按 flag 暂存，引用回复时按内容兜底定位")
+            self._store.save_config()
+            # #205：全局开关关闭时不发管理员通知
+            if self.config.get("join_request_notify_enabled", True):
+                await self._api._notify_admins(
+                    f"[加群请求] {user_id} 申请加入群 {group_id}\n"
+                    f"已在群内发送提醒，请管理员引用回复同意/拒绝",
+                    group_id=group_id,
+                )
         else:
             # #226：未开启群内提醒时，全局开关打开也必须通知管理员，
             # 否则普通加群申请不会有任何通知（旧实现只在此 if 内发送）。
@@ -201,7 +222,10 @@ class JoinReviewService:
         if not (reply_id and has_permission):
             return
         pending = self._store.runtime_map("pending_join_requests")
-        info = pending.get(str(reply_id))
+        # #258：通知消息 ID 没记进待处理表时，按被引用消息内容里的
+        # 「用户qq号」兜底定位同群待处理记录
+        info = pending.get(str(reply_id)) or self._api._match_pending_by_quote(
+            event, group_id, str(reply_id), pending)
         if not info:
             return
         msg_text = self._mp._extract_text(raw)
@@ -225,16 +249,19 @@ class JoinReviewService:
             reject_reason = custom if custom else self._store.get_group_setting(
                 group_id, "join_reject_reason", "不满足加群条件") or "不满足加群条件"
         # #228：接口调用失败时不能回复"已同意/已拒绝"
+        # #252：sub_type 用申请事件原值，提高协议端兼容性
         handled = await self._api._handle_group_request(
-            event, info["flag"], approve, reject_reason)
+            event, info["flag"], approve, reject_reason,
+            sub_type=str(info.get("sub_type") or "add"))
         result = "拉黑" if blacklist else ("同意" if approve else "拒绝")
         if not handled:
             yield event.plain_result(
                 f"处理 {info['user_id']} 的加群申请失败（协议端拒绝或接口不可用，"
                 f"详见日志），请稍后重试")
             return
-        # 清理已处理的记录
-        del pending[str(reply_id)]
+        # 清理已处理的记录（#258：兜底匹配可能存在同记录多键，全部清掉）
+        for key in [k for k, v in pending.items() if v is info]:
+            del pending[key]
         self._store.save_config()
         yield event.plain_result(f"已{result} {info['user_id']} 的加群申请")
 

@@ -1002,11 +1002,13 @@ class GroupAdminPlugin(Star):
             yield event.plain_result("此指令只能在群聊中使用")
             return
         group_id = str(raw.get("group_id"))
-        if not self._perms._is_authorized(raw, str(raw.get("user_id", ""))):
-            yield event.plain_result("只有群管理员或群主可执行此操作")
-            return
-
         reply_id = self._mp._get_reply_id(event)
+        if not self._perms._is_authorized(raw, str(raw.get("user_id", ""))):
+            # #250：bot 主人（AstrBot admins_id）未任群管时，仅放宽「引用撤回
+            # bot 自身消息」这一条路径；其余撤回（@用户 N / N 条）仍需群管权限
+            if not (reply_id and await self._perms._owner_may_recall_quoted(event, reply_id)):
+                yield event.plain_result("只有群管理员或群主可执行此操作（bot 主人可引用撤回 bot 自己的消息）")
+                return
         target_qq = self._mp._extract_at_qq(raw)
         self_msg_id = str(raw.get("message_id", "")) if raw.get("message_id") else ""
         # 撤回成功提示：show_recall_notice 控制（全局或按群覆盖），关闭时成功静默；失败仍提示。
@@ -1227,8 +1229,10 @@ class GroupAdminPlugin(Star):
         ok = await self._api._delete_essence(event, reply_id, group_id=str(raw.get("group_id")))
         yield event.plain_result("取消设精成功" if ok else "取消设精失败")
 
-    # #24: 改群头像
-    @filter.command("改群头像", "引用图片回复即可修改群头像")
+    # #24: 改群头像；#251：补「设群头像/设置群头像」别名，防止未注册指令被
+    # AstrBot 核心 LLM 兜底接管（报「未找到任何可用的对话模型」）
+    @filter.command("改群头像", "引用图片回复即可修改群头像",
+                    alias={"设群头像", "设置群头像"})
     async def set_group_avatar_cmd(self, event: AstrMessageEvent):
         raw = self._mp._get_raw_message(event)
         if not raw or not raw.get("group_id"):
@@ -1449,22 +1453,24 @@ class GroupAdminPlugin(Star):
             return
         group_id = str(raw.get("group_id"))
         member_list = await self._api._execute_action(event, "get_group_member_list",
-                                                  group_id=group_id, return_raw=True)
+                                                      group_id=group_id, return_raw=True)
+        members = self._api._normalize_member_list(member_list)
+        if members is None:
+            # #256：列表获取失败与「无人被禁言」分开提示，避免误判
+            yield event.plain_result(
+                "获取群成员列表失败（当前 OneBot 实现可能不支持 get_group_member_list），"
+                "无法查询禁言列表")
+            return
         muted = []
-        if isinstance(member_list, dict):
-            data = member_list.get("data") or member_list
-            if isinstance(data, list):
-                for m in data:
-                    if not isinstance(m, dict):
-                        continue
-                    mute_left = m.get("mute_left", 0)
-                    if isinstance(mute_left, (int, float)) and mute_left > 0:
-                        uid = str(m.get("user_id", ""))
-                        nick = m.get("nickname", "")
-                        card = m.get("card", "") or ""
-                        name = card if card else nick
-                        minutes = max(1, int(mute_left / 60))
-                        muted.append(f"{uid}（{name}）剩余 {minutes} 分钟")
+        for m in members:
+            remaining = self._api._member_mute_remaining(m)
+            if remaining > 0:
+                uid = str(m.get("user_id", ""))
+                nick = m.get("nickname", "")
+                card = m.get("card", "") or ""
+                name = card if card else nick
+                minutes = max(1, remaining // 60)
+                muted.append(f"{uid}（{name}）剩余 {minutes} 分钟")
         if not muted:
             yield event.plain_result("本群当前无被禁言成员")
             return
@@ -1803,8 +1809,15 @@ class GroupAdminPlugin(Star):
             yield event.plain_result(f"已添加群标签「{text}」")
             return
         logger.warning(f"添加群标签失败: group={group_id} tag={text} result={result}")
-        yield event.plain_result(
-            f"添加群标签失败：{self._api._describe_action_failure(result, 'set_group_tag')}")
+        detail = self._api._describe_action_failure(result, 'set_group_tag')
+        # #249：set_group_tag 是 LLOneBot 等个别协议端的扩展接口，并非 OneBot v11
+        # 标准 action，go-cqhttp / NapCat / Lagrange 均未提供，无跨实现候选可回退；
+        # 失败时把这一点讲清楚，避免用户误以为是插件或权限问题
+        if ("不支持" in detail) or ("无可用调用通路" in detail):
+            detail += ("。set_group_tag 并非 OneBot v11 标准接口，仅部分协议端"
+                       "（如 LLOneBot）提供，当前协议端不支持且无替代接口；"
+                       "请更换/升级协议端，或在 QQ 客户端手动设置群标签")
+        yield event.plain_result(f"添加群标签失败：{detail}")
 
     # #162: /添加违禁图片 — 引用图片消息加入违禁图列表（群管/群主）
     @filter.command("添加违禁图片", "引用图片消息加入违禁图列表")

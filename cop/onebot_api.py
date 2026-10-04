@@ -11,6 +11,8 @@
 
 from __future__ import annotations
 
+import re
+import time
 from typing import TYPE_CHECKING
 
 from astrbot.api import logger
@@ -201,6 +203,54 @@ class OneBotApi:
 
     # ---------- 具体 action 封装 ----------
 
+    @staticmethod
+    def _normalize_member_list(result):
+        """把 get_group_member_list 的返回规整为成员 dict 列表；拿不到列表返回 None。
+
+        #256：aiocqhttp 的 call_action 成功时直接返回 data 本身（即成员列表），
+        部分框架再包一层 {data: [...]}；失败响应是含 status/retcode 的 dict 但没有
+        data 列表。旧实现只认 dict 形态，列表形态会被误判为「无被禁言成员」。
+        """
+        if isinstance(result, list):
+            return [m for m in result if isinstance(m, dict)]
+        if isinstance(result, dict):
+            data = result.get("data")
+            if isinstance(data, list):
+                return [m for m in data if isinstance(m, dict)]
+        return None
+
+    @staticmethod
+    def _member_mute_remaining(m: dict) -> int:
+        """读取单个成员的剩余禁言秒数（0=未禁言）。
+
+        #256：不同 OneBot 实现字段不同——OneBot v11 标准成员对象用
+        shut_up_timestamp（禁言到期 Unix 时间戳，0=未禁言），部分实现给
+        mute_left 等剩余秒数，另有 ban_end_time / mute_end_time / mute_until
+        等到期时间戳变体。旧实现只认 mute_left，导致多数协议端恒判「无人被禁言」。
+        """
+        now = int(time.time())
+        for key in ("mute_left", "mute_time_remaining", "ban_left"):
+            try:
+                v = float(m.get(key))
+            except (TypeError, ValueError):
+                continue
+            if v > 0:
+                return int(v)
+        for key in ("shut_up_timestamp", "ban_end_time", "mute_end_time", "mute_until"):
+            try:
+                v = float(m.get(key))
+            except (TypeError, ValueError):
+                continue
+            if v <= 0:
+                continue
+            if v >= 1_000_000_000:
+                remaining = int(v) - now
+                if remaining > 0:
+                    return remaining
+            else:
+                return int(v)
+        return 0
+
     async def _recall_message(self, event: AstrMessageEvent, message_id: str):
         """撤回消息。OneBot 标准 API 名为 delete_msg。"""
         return await self._execute_action(event, "delete_msg", message_id=message_id)
@@ -352,23 +402,79 @@ class OneBotApi:
         return await self._execute_action(event, "set_group_portrait",
                                           group_id=group_id, file=file)
 
-    async def _handle_group_request(self, event: AstrMessageEvent, flag: str, approve: bool, reason: str = ""):
+    async def _handle_group_request(self, event: AstrMessageEvent, flag: str, approve: bool,
+                                    reason: str = "", sub_type: str = "add") -> bool:
         """同意/拒绝加群申请，返回是否真正成功（#228）。
 
         OneBot v11 标准接口为 set_group_add_request（需 flag + sub_type + approve），
         旧实现只调用的 handle_group_request 并非标准 action；且调用方从不校验返回值，
         导致协议端拒绝后仍回复"已同意"。这里按顺序回退并返回真实结果。
+
+        #252：部分实现要求 sub_type 与申请事件一致（add/invite），改用申请事件
+        自带的 sub_type 而非硬编码 "add"；个别实现拒收 sub_type 参数，追加一次
+        不带 sub_type 的尝试；逐个记录真实失败原因，不再只报最后一个候选的
+        「不支持接口」，避免 flag 过期等真实原因被掩盖。
         """
         params = {"flag": flag, "approve": approve}
         if not approve and reason:
             params["reason"] = reason
-        ok, res = await self._call_action_fallback(
-            event, ("set_group_add_request", "handle_group_request"),
-            sub_type="add", **params)
-        if not ok:
-            logger.warning(f"[加群审核] 处理失败 flag={flag} approve={approve}: "
-                           f"{self._describe_action_failure(res, 'set_group_add_request')}")
-        return ok
+        attempts = []
+        candidates = (
+            ("set_group_add_request", {"sub_type": sub_type or "add"}),
+            ("set_group_add_request", {}),
+            ("handle_group_request", {}),
+        )
+        for action, extra in candidates:
+            p = dict(params)
+            p.update(extra)
+            res = await self._call_onebot_raw(event, action, **p)
+            if self._action_result_success(res):
+                return True
+            attempts.append(f"{action}{extra and list(extra.keys()) or ''}: "
+                            f"{self._describe_action_failure(res, action)}")
+        logger.warning(f"[加群审核] 处理失败 flag={flag} approve={approve}: " + "；".join(attempts))
+        return False
+
+    async def _match_pending_by_quote(self, event, group_id: str, reply_id: str,
+                                      pending: dict) -> dict:
+        """#258：被引用消息 ID 不在待处理表时的兜底定位。
+
+        拉取被引用消息原文，若确为插件发的【新人加群】通知，则按其中
+        「用户qq号：X」匹配同群待处理记录（多条例取最新一条）。被引用消息
+        拉取失败或内容不含通知特征时不兜底——避免把普通聊天里的「同意」
+        误处理成加群审核。
+        """
+        try:
+            quoted = await self._execute_action(event, "get_msg",
+                                                message_id=reply_id, return_raw=True)
+        except Exception as exc:
+            logger.debug(f"[加群审核] 兜底定位：get_msg 失败: {exc}")
+            return {}
+        qdata = None
+        if isinstance(quoted, dict):
+            qdata = quoted.get("data") if isinstance(quoted.get("data"), dict) else quoted
+        if not isinstance(qdata, dict):
+            return {}
+        parts = []
+        for seg in (qdata.get("message") or []):
+            if isinstance(seg, dict) and seg.get("type") == "text":
+                parts.append(str((seg.get("data") or {}).get("text", "")))
+        qtext = "".join(parts)
+        if "【新人加群】" not in qtext:
+            return {}
+        m = re.search(r"用户qq号[:：]\s*(\d{5,12})", qtext)
+        if not m:
+            return {}
+        uid = m.group(1)
+        matched = {}
+        for rec in pending.values():
+            if (isinstance(rec, dict) and str(rec.get("group_id")) == str(group_id)
+                    and str(rec.get("user_id")) == uid):
+                matched = rec
+        if matched:
+            logger.info(f"[加群审核] 引用消息 {reply_id} 不在待处理表，"
+                        f"已按通知内容定位到用户 {uid} 的待处理申请")
+        return matched
 
     # ---------- 消息收发辅助 ----------
 
@@ -385,28 +491,40 @@ class OneBotApi:
         """查找群主 QQ 号，用于 #140 举报分级路由。返回 QQ 号字符串，找不到返回空串。"""
         member_list = await self._execute_action(event, "get_group_member_list",
                                                  group_id=group_id, return_raw=True)
-        if isinstance(member_list, dict):
-            data = member_list.get("data") or member_list
-            if isinstance(data, list):
-                for m in data:
-                    if isinstance(m, dict) and m.get("role") == "owner":
-                        return str(m.get("user_id", ""))
+        for m in self._normalize_member_list(member_list) or []:
+            if m.get("role") == "owner":
+                return str(m.get("user_id", ""))
         return ""
 
     async def _send_group_text(self, event: AstrMessageEvent, group_id: str, text: str):
-        """向指定群发送纯文本消息，返回 message_id（用于后续引用回复关联）。"""
+        """向指定群发送纯文本消息，返回 message_id（用于后续引用回复关联）。
+
+        #258：旧实现探测 self.context.send_group_msg——AstrBot Context 并不暴露
+        该 OneBot action，探测必然失败，实际总走 _send 兜底并返回空串，导致
+        加群申请通知的 message_id 记不进待处理表，管理员引用回复 /同意 时
+        永远查不到记录。这里改为优先走 OneBot send_group_msg（event.bot 直调），
+        从响应 data.message_id 拿真实消息 ID。
+        """
+        raw = await self._call_onebot_raw(event, "send_group_msg",
+                                          group_id=str(group_id), message=text)
+        if self._action_result_success(raw):
+            data = raw.get("data") if isinstance(raw, dict) else None
+            if isinstance(data, dict) and data.get("message_id"):
+                return str(data["message_id"])
+            if isinstance(data, (int, str)) and str(data):
+                return str(data)
+            # set 类 action 成功但没回 message_id：消息已发出，仍按空串处理
+            logger.warning("[加群审核] send_group_msg 成功但未返回 message_id")
         try:
             if hasattr(self.context, "send_group_msg"):
-                # AstrBot 标准方法：send_group_msg(group_id=, message=)
                 result = await self.context.send_group_msg(group_id=int(group_id), message=text)
-                # 返回值可能直接是 message_id，也可能是含 message_id 的 dict
                 if isinstance(result, dict):
                     return str(result.get("message_id") or result.get("data", {}).get("message_id", ""))
                 return str(result) if result else ""
-            # 回退：使用 _send 但拿不到 message_id
-            await self._send(event, [Plain(text)])
         except Exception as e:
             logger.error(f"发送群消息失败: {e}")
+        # 回退：使用 _send 但拿不到 message_id
+        await self._send(event, [Plain(text)])
         return ""
 
     @staticmethod
@@ -423,6 +541,21 @@ class OneBotApi:
                 return text
         return ""
 
+    async def _get_stranger_info(self, event: AstrMessageEvent, user_id: str) -> dict:
+        """通过 OneBot get_stranger_info 获取陌生用户资料（昵称/等级等），失败返回 {}。
+
+        #257：旧实现探测 self.context.get_stranger_info 属性——AstrBot Context
+        不暴露 OneBot action，探测必然失败，昵称静默回退成 QQ 号、QQ 等级恒为
+        「未知」。统一改走 _execute_action（event.bot.call_action 优先），并兼容
+        「裸 data」与「{data: {...}}」两种返回形态。
+        """
+        raw = await self._execute_action(event, "get_stranger_info",
+                                         user_id=str(user_id), return_raw=True)
+        info = None
+        if isinstance(raw, dict):
+            info = raw.get("data") if isinstance(raw.get("data"), dict) else raw
+        return info if isinstance(info, dict) else {}
+
     async def _get_user_nickname(self, event: AstrMessageEvent, user_id: str) -> str:
         """获取用户昵称（OneBot get_stranger_info，多字段名兜底，#261）。
 
@@ -431,18 +564,11 @@ class OneBotApi:
         全部缺失时记录 warning 便于排查，并返回空串（由调用方决定展示文案）。
         """
         try:
-            handler = getattr(self.context, "get_stranger_info", None)
-            if callable(handler):
-                info = await handler(user_id=int(user_id))
-                data = info.get("data") if isinstance(info, dict) else None
-                if not isinstance(data, dict):
-                    data = info if isinstance(info, dict) else {}
-                name = self._first_str_field(data, ("nickname", "nick", "card", "name"))
-                if not name and hasattr(info, "nickname"):
-                    name = str(getattr(info, "nickname") or "").strip()
-                if name:
-                    return name
-                logger.warning(f"[加群通知] get_stranger_info 未返回昵称字段(user={user_id})：{info}")
+            info = await self._get_stranger_info(event, user_id)
+            name = self._first_str_field(info, ("nickname", "nick", "card", "name"))
+            if name:
+                return name
+            logger.warning(f"[加群通知] get_stranger_info 未返回昵称字段(user={user_id})：{info}")
         except Exception as e:
             logger.warning(f"[加群通知] 获取昵称失败(user={user_id}): {e}")
         return ""
@@ -450,16 +576,11 @@ class OneBotApi:
     async def _get_stranger_level(self, event: AstrMessageEvent, user_id: str) -> str:
         """获取陌生人 QQ 等级（get_stranger_info 的 level 字段，#189；不支持返回空串）。"""
         try:
-            handler = getattr(self.context, "get_stranger_info", None)
-            if callable(handler):
-                info = await handler(user_id=int(user_id))
-                data = info.get("data") if isinstance(info, dict) else None
-                if not isinstance(data, dict):
-                    data = info if isinstance(info, dict) else {}
-                level = self._first_str_field(data, ("level",))
-                if level:
-                    return level
-                logger.warning(f"[加群通知] get_stranger_info 未返回等级字段(user={user_id})")
+            info = await self._get_stranger_info(event, user_id)
+            level = self._first_str_field(info, ("level",))
+            if level:
+                return level
+            logger.warning(f"[加群通知] get_stranger_info 未返回等级字段(user={user_id})")
         except Exception as e:
             logger.warning(f"[加群通知] 获取等级失败(user={user_id}): {e}")
         return ""

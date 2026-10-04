@@ -205,3 +205,6 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# 插件运行时生成的本地数据与 T2I 模板（不应入库）
+data/

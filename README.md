@@ -40,7 +40,7 @@
 | `/禁我 [分钟]` | 任意成员 | 自怼（默认 10 分钟） |
 | `/排名` | 任意成员 | 查看本群发言排名 |
 | `/清除数据` | 插件管理员 | 清除本群发言计数 |
-| `/举报` | 任意成员 | 举报群成员违规行为（需引用消息） |
+| `/举报` | 任意成员 | 举报群成员违规行为（@ 成员，或引用/回复其消息后发送 举报，#227） |
 | `/添加群待办` | 插件管理员 | 引用消息设为群待办 |
 | `/取消群待办` | 插件管理员 | 引用消息取消群待办 |
 | `/加群申请待处理` | 插件管理员 | 查看本群未处理的加群申请列表 |
@@ -217,6 +217,7 @@ pip install astrbot_plugin_group_admin
 | `colloquial_enabled` | bool | `true` | 启用口语化群管指令（#254）：@bot 后用自然语言触发禁言/解禁/踢人/设管理/取消管理；关闭后仅识别 `/` 前缀标准命令。推荐按群覆盖 |
 | `group_name_notice` | bool | `true` | 修改群名成功后是否群内通知（关闭时仅失败提示；推荐按群覆盖） |
 | `reject_re_add` | bool | `false` | 踢人后自动拒绝该用户再次加群 |
+| `spam_exclude_pure_media` | bool | `false` | 刷屏检测排除纯媒体消息（仅含图片/表情包且无可见文本的消息不计入刷屏窗口，#260；推荐按群覆盖） |
 | `auto_recall_keywords` | list | `[]` | Bot 发言自动撤回关键词列表（推荐按群覆盖） |
 | `auto_recall_enabled_groups` | list | `[]` | 启用自动撤回的群 ID 列表（**留空 = 全群启用**，#192；`*` / `all` 表示全部，或填指定群号） |
 | `enabled_groups` | list | `[]` | 启用违规检测的群号列表（**留空 = 全群启用**，#192；`*` / `all` 表示全部，或填指定群号；推荐按群覆盖） |
@@ -451,7 +452,13 @@ A: 检查 `api_endpoint` / `api_key` / `model_name` 是否已配置，日志中�
 A: ① 调整 `threshold`（降低更严格）；② 更换视觉模型；③ 通过 `detection_prompt` 自定义检测提示词。
 
 **Q: 刷屏检测误判？**
-A: 调大 `spam_threshold` 和 `spam_time_window`，例如 10 条 / 20 秒更宽松。
+A: 调大 `spam_threshold` 和 `spam_time_window`，例如 10 条 / 20 秒更宽松；若只是纯图片/表情包被误判，可开启 `spam_exclude_pure_media`（#260，纯媒体消息不计入刷屏窗口）。
+
+**Q: 表情包只发一次却被自动撤回？**
+A: 已修复（#260）：Bot 发言自动撤回关键词只匹配「本次发送的可见文本」，纯图片/表情包消息不再被误撤回；若开启 `spam_exclude_pure_media` 还可让纯媒体不计入刷屏窗口。仍被撤回时请检查 `/查看自动撤回关键词` 与 `spam_check_enabled`。
+
+**Q: 加群通知里昵称显示成 QQ 号 / 等级显示「未知」？**
+A: 多数字段名兜底与失败标注见 #261：若协议端 `get_stranger_info` 未返回昵称/等级，通知会显示「获取失败(QQ号)」/「未知」并记录日志，需排查协议端实现与版本。
 
 **Q: 如何关闭某个检测？**
 A: 对应开关配置设为 false（如 `spam_check_enabled`、`profanity_check_enabled`、`ad_check_enabled`、`link_check_enabled`、`group_promotion_check_enabled`），可按群覆盖。
@@ -477,19 +484,38 @@ A: OneBot `delete_msg` 只能撤回约 2 分钟内的消息，超时会静默失
 
 ---
 
-## 目录结构
+## 项目结构
+
+插件采用「门面 + 服务层」分层架构：`main.py` 仅保留 `@register` 类与全部对外接口（`@filter` 命令 / 事件 / 钩子），业务逻辑下沉至插件私有子包 `cop/`（L0-L4 单向依赖、显式依赖注入、无全局单例）。
 
 ```
 astrbot_plugin_gm/
-├── main.py              # 插件主逻辑（3100+ 行）
+├── main.py              # 门面：@register 类 + 全部 @filter 入口（约 2447 行）
 ├── metadata.yaml         # 插件元信息
 ├── _conf_schema.json     # 配置项说明
 ├── README.md             # 本文件
 ├── NOTICE                # 第三方代码声明（astrbot_plugin_group_moderation 移植）
 ├── LICENSE               # AGPL-3.0 License
 ├── requirements.txt      # Python 依赖（aiohttp）
+├── docs/
+│   └── ARCHITECTURE.md   # 架构说明（分层、依赖方向、模块职责、扩展与测试）
+├── cop/                  # 插件私有子包（业务逻辑分层，20 个模块）
+│   ├── compat.py / constants.py / text_utils.py          # L0 基础层
+│   ├── json_store.py / config_store.py                   # L1 存储层
+│   ├── permissions.py / message_parse.py / onebot_api.py / runtime.py  # L2 能力层
+│   ├── history.py / stats.py / messaging.py              # L3a 领域服务
+│   ├── conversational.py                                 # L3b 重复表情包 + 口语化指令
+│   ├── join_review.py                                    # L3b 加群审核
+│   ├── moderation/                                       # L3b 违规检测业务域
+│   └── ...                                               # 其余分层模块
 └── .github/              # GitHub 配置
 ```
+
+> 注：`cop/message_parse.py` 内含 `MessageParser` 与 `TargetResolver`（原 `target_resolver.py` 已并入）；
+> `cop/conversational.py` 内含 `ColloquialService` 与 `DupFaceService`（原 `colloquial.py`、`dup_face.py` 已并入）。
+> 上述均为**物理归并**，对外类名 / 行为 / 分层契约不变。
+
+> 完整目录树、分层依赖图、各模块职责与扩展/测试指引见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)。
 
 ---
 

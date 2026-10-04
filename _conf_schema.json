@@ -181,6 +181,12 @@
         "hint": "推荐按群覆盖。",
         "default": 10
     },
+    "spam_exclude_pure_media": {
+        "description": "刷屏检测排除纯媒体消息",
+        "type": "bool",
+        "hint": "开启后，仅含图片/表情包且无可见文本的消息不计入刷屏窗口，避免只发表情包被误判刷屏（#260）。推荐按群覆盖。",
+        "default": false
+    },
     "spam_ban_duration": {
         "description": "刷屏禁言时长（秒）",
         "type": "int",

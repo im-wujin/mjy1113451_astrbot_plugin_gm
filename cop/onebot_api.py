@@ -409,19 +409,60 @@ class OneBotApi:
             logger.error(f"发送群消息失败: {e}")
         return ""
 
+    @staticmethod
+    def _first_str_field(source: dict, keys) -> str:
+        """从 dict 中按顺序返回首个非空字符串字段值（#261）。"""
+        if not isinstance(source, dict):
+            return ""
+        for key in keys:
+            val = source.get(key)
+            if val is None:
+                continue
+            text = str(val).strip()
+            if text:
+                return text
+        return ""
+
     async def _get_user_nickname(self, event: AstrMessageEvent, user_id: str) -> str:
-        """获取用户昵称（通过 OneBot get_stranger_info API）。"""
+        """获取用户昵称（OneBot get_stranger_info，多字段名兜底，#261）。
+
+        部分协议端不返回 `nickname`，而是 `nick` / `card` / `name` 等字段，
+        旧实现只读 `nickname` 导致昵称回落成 QQ 号。这里按候选字段顺序提取，
+        全部缺失时记录 warning 便于排查，并返回空串（由调用方决定展示文案）。
+        """
         try:
             handler = getattr(self.context, "get_stranger_info", None)
             if callable(handler):
                 info = await handler(user_id=int(user_id))
-                if isinstance(info, dict):
-                    return info.get("nickname") or info.get("data", {}).get("nickname", user_id)
-                if hasattr(info, "nickname"):
-                    return info.nickname
+                data = info.get("data") if isinstance(info, dict) else None
+                if not isinstance(data, dict):
+                    data = info if isinstance(info, dict) else {}
+                name = self._first_str_field(data, ("nickname", "nick", "card", "name"))
+                if not name and hasattr(info, "nickname"):
+                    name = str(getattr(info, "nickname") or "").strip()
+                if name:
+                    return name
+                logger.warning(f"[加群通知] get_stranger_info 未返回昵称字段(user={user_id})：{info}")
         except Exception as e:
-            logger.error(f"获取昵称失败: {e}")
-        return user_id
+            logger.warning(f"[加群通知] 获取昵称失败(user={user_id}): {e}")
+        return ""
+
+    async def _get_stranger_level(self, event: AstrMessageEvent, user_id: str) -> str:
+        """获取陌生人 QQ 等级（get_stranger_info 的 level 字段，#189；不支持返回空串）。"""
+        try:
+            handler = getattr(self.context, "get_stranger_info", None)
+            if callable(handler):
+                info = await handler(user_id=int(user_id))
+                data = info.get("data") if isinstance(info, dict) else None
+                if not isinstance(data, dict):
+                    data = info if isinstance(info, dict) else {}
+                level = self._first_str_field(data, ("level",))
+                if level:
+                    return level
+                logger.warning(f"[加群通知] get_stranger_info 未返回等级字段(user={user_id})")
+        except Exception as e:
+            logger.warning(f"[加群通知] 获取等级失败(user={user_id}): {e}")
+        return ""
 
     async def _notify_admins(self, text: str, group_id: str = ""):
         """向 join_notify_admins 配置的管理员发送私聊通知。"""

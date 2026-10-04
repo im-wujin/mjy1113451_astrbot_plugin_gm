@@ -101,7 +101,7 @@ def _runtime_prop(name):
     "group_admin",
     "YourName",
     "QQ群群管插件 - 禁言/踢人/头衔/精华/撤回/群公告/关键词撤回/违规检测/排名",
-    "2.4.0",
+    "2.5.0",
     "https://github.com/mjy1113451/astrbot_plugin_gm"
 )
 class GroupAdminPlugin(Star):
@@ -1379,7 +1379,7 @@ class GroupAdminPlugin(Star):
         yield event.plain_result("已清除本群发言数据，重新开始计数")
 
     # #21: 举报违规
-    @filter.command("举报", "举报群成员违规行为（需要引用消息）")
+    @filter.command("举报", "举报群成员违规行为（@成员或引用其消息）")
     async def report_cmd(self, event: AstrMessageEvent, reason: str = ""):
         raw = self._mp._get_raw_message(event)
         if not raw or not raw.get("group_id"):
@@ -1387,9 +1387,12 @@ class GroupAdminPlugin(Star):
             return
         group_id = str(raw.get("group_id"))
         reporter_id = str(raw.get("user_id"))
+        # #227：优先 @ 成员；未 @ 时通过「引用（回复）被举报成员的消息」定位目标
         target_qq = self._mp._extract_at_qq(raw)
         if not target_qq:
-            yield event.plain_result("请 @要举报的成员")
+            _quoted_name, target_qq = await self._resolver._resolve_quoted_sender(event, raw)
+        if not target_qq:
+            yield event.plain_result("请 @要举报的成员，或引用（回复）其消息后再发送 举报")
             return
         # #140: 群主豁免 — 群主不触发举报
         reporter_role = raw.get("sender", {}).get("role", "")
@@ -2404,7 +2407,9 @@ class GroupAdminPlugin(Star):
                 "（当前 OneBot 实现可能不在 get_group_msg_history 中返回机器人自身消息）"
             )
 
-        # 3) 关键词自动撤回
+        # 3) 关键词自动撤回（#46）
+        # #260：只用「本次发送链的可见文本」判定——纯图片/表情包消息 bot_text 为空，
+        # 直接返回，不会再用图片文件名/URL 等回退文本匹配关键词而被误撤回。
         enabled = self._store.get_group_setting(group_id, "auto_recall_enabled_groups", [])
         keywords = self._store.get_group_setting(group_id, "auto_recall_keywords", [])
         # #192 owner 拍板：留空 = 全群启用（keywords 为空时本就无命中，不产生实际撤回）；
@@ -2415,16 +2420,13 @@ class GroupAdminPlugin(Star):
         elif enabled and "*" not in [str(x) for x in enabled] \
                 and "all" not in [str(x) for x in enabled] and group_id not in [str(x) for x in enabled]:
             return
-        if not keywords:
+        if not keywords or not bot_text:
             return
-        # 优先用本次发送链的完整文本判断；无文本（纯图片/语音等）时回退到最新 bot 发言
-        match_text = bot_text or (bot_messages[0][1] if bot_messages else "")
-        if not match_text:
-            return
-        if not any(kw in match_text for kw in keywords):
+        if not any(kw in bot_text for kw in keywords):
             return
 
-        # 只撤回本次发送窗口内的 bot 消息，避免误伤更早的历史发言
+        # 只撤回本次发送窗口内的 bot 消息，避免误伤更早的历史发言；
+        # 命中判定同样只用纯文本（不拿预览/文件名匹配），避免表情包被误撤回（#260）
         now = int(time.time())
         recent = [m for m in bot_messages if not m[3] or now - m[3] <= 30]
         matched = [m for m in recent if m[1] and any(kw in m[1] for kw in keywords)]
@@ -2435,6 +2437,7 @@ class GroupAdminPlugin(Star):
                 "当前 OneBot 实现可能不在 get_group_msg_history 中返回机器人自身消息"
             )
             return
+        logger.debug(f"[自动撤回] 群 {group_id} 命中关键词，目标消息 {[m[0] for m in targets]}")
         for msg_id, _text, _preview, _t in targets:
             # #202：记录撤回结果，失败时给出原因，避免静默
             ok, err = await self._api._do_recall(event, msg_id)

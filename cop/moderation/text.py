@@ -45,7 +45,13 @@ class TextModeration:
 
     # ===================== 刷屏检测 =====================
 
-    async def _check_spam(self, group_id: str, user_id: str) -> bool:
+    async def _check_spam(self, group_id: str, user_id: str,
+                         has_text: bool = True, has_media: bool = False) -> bool:
+        """刷屏检测。
+
+        #260：新增 `spam_exclude_pure_media`（默认关）——开启后，纯图片/表情包
+        （无可见文本的媒体消息）不计入刷屏窗口，避免「只发表情包被误判刷屏」。
+        """
         try:
             threshold = int(self._store.get_group_setting(group_id, "spam_threshold", 5) or 5)
             window = int(self._store.get_group_setting(group_id, "spam_time_window", 10) or 10)
@@ -54,6 +60,10 @@ class TextModeration:
         if not self._store.get_group_setting(group_id, "spam_check_enabled", True):
             return False
         if threshold <= 0 or window <= 0:
+            return False
+        # #260：可选排除纯媒体消息（无文本且含图片/表情包）
+        if not has_text and has_media \
+                and self._store.get_group_setting(group_id, "spam_exclude_pure_media", False):
             return False
         now = time.time()
         key = f"{group_id}_{user_id}"

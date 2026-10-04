@@ -194,8 +194,11 @@ class ModerationService:
             logger.debug(f"[违规检测] 群 {group_id} 用户 {user_id} 命中管理员豁免，跳过检测")
             return False
         msg_text = self._mp._extract_text(raw) if isinstance(raw, dict) else ""
-        # 1) 刷屏（不依赖文本）
-        if await self._text._check_spam(group_id, user_id):
+        # 1) 刷屏（不依赖文本；#260 传入文本/媒体标志以支持「排除纯媒体」）
+        seg_types = [s.get("type") for s in (raw.get("message") or []) if isinstance(s, dict)] \
+            if isinstance(raw, dict) else []
+        has_media = any(t in ("image", "face") for t in seg_types)
+        if await self._text._check_spam(group_id, user_id, bool(msg_text), has_media):
             mid = str(raw.get("message_id", "")) if isinstance(raw, dict) else ""
             await self._handle_violation(event, "spam", group_id, user_id, mid)
             return True
@@ -242,6 +245,8 @@ class ModerationService:
             violated, reason = await self._image._check_image(url)
             if violated:
                 mid = str(raw.get("message_id", "")) if isinstance(raw, dict) else ""
+                # #260：命中记录可诊断日志（含群号/用户/消息ID/原因），便于区分 AI 误判
+                logger.info(f"[群违规检测] 群 {group_id} 用户 {user_id} 图片违规(消息 {mid}): {reason}")
                 await self._handle_violation(event, "image", group_id, user_id, mid, reason)
                 return True
         # 4) 语音转文字检测（#128）

@@ -378,22 +378,31 @@ class TargetResolver:
 
     async def _resolve_quoted_target(self, event, raw: dict) -> str:
         """回复消息时取被回复消息发送者的 QQ；取不到返回空串。"""
+        _name, qq = await self._resolve_quoted_sender(event, raw)
+        return qq
+
+    async def _resolve_quoted_sender(self, event, raw: dict) -> tuple:
+        """取被回复消息发送者的 (昵称, QQ号)；取不到返回 ("", "")。
+
+        #227：供 /举报 在未 @ 成员时，通过「引用被举报成员的消息」定位目标。
+        """
         reply_id = self._mp._get_reply_id(event)
         if not reply_id:
-            return ""
+            return "", ""
         try:
             ok, res = await self._api._call_action_fallback(event, ("get_msg",), message_id=int(reply_id))
         except Exception:
-            return ""
+            return "", ""
         if not ok or not isinstance(res, dict):
-            return ""
+            return "", ""
         data = res.get("data") if isinstance(res.get("data"), dict) else res
         if isinstance(data, dict):
             sender = data.get("sender") or {}
             qq = sender.get("user_id") or data.get("user_id")
             if qq:
-                return str(qq)
-        return ""
+                name = str(sender.get("card") or sender.get("nickname") or "")
+                return name, str(qq)
+        return "", ""
 
     async def _resolve_colloquial_target(self, event, raw: dict, text: str) -> str:
         """口语化指令的目标解析：@提及 > 回复消息 > 群内 QQ 号 > @名字。"""

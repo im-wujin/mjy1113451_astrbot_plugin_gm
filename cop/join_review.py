@@ -155,21 +155,15 @@ class JoinReviewService:
         # 群内提醒（#57）：发送申请消息到对应群聊，等待管理员引用回复同意/拒绝
         if self._store.get_group_setting(group_id, "join_request_notify_in_group", False):
             nickname = await self._api._get_user_nickname(event, user_id)
-            # #189：补充 QQ 等级（get_stranger_info 的 level 字段，协议端不支持时显示未知）
-            level = ""
-            try:
-                handler = getattr(self.context, "get_stranger_info", None)
-                if callable(handler):
-                    info = await handler(user_id=int(user_id))
-                    info_data = info.get("data", info) if isinstance(info, dict) else {}
-                    level = str(info_data.get("level") or "未知")
-            except Exception:
-                level = "未知"
+            # #189：补充 QQ 等级（协议端不支持时显示「未知」）
+            level = await self._api._get_stranger_level(event, user_id) or "未知"
+            # #261：昵称获取失败时明确标注，避免管理员误以为昵称就是 QQ 号
+            nickname_display = nickname or f"获取失败({user_id})"
             notify_text = (
                 f"【新人加群】通知\n"
-                f"用户qq昵称：{nickname}\n"
+                f"用户qq昵称：{nickname_display}\n"
                 f"用户qq号：{user_id}\n"
-                f"qq等级：{level or '未知'}\n"
+                f"qq等级：{level}\n"
                 f"加群验证消息：{comment or '无'}\n"
                 f"回复 /同意 或 /拒绝 或 /拉黑（引用本消息）"
             )

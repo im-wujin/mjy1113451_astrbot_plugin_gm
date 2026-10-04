@@ -6,6 +6,9 @@
 与 cop/constants.py 探测常量；`_check_group_promotion` 抽出 `_extract_promotion_group_numbers`
 供 service.py 共用；语音检测链路同步接入存在性验证。无需附带默认头像图片文件。
 
+#233 新增群公告发布后群内通知开关（`announce_notify`，默认开）——`/发群公告` 成功发布后
+自动发送「📢 管理员已发布群公告，请各位成员注意查看」提醒；可按群覆盖，指令 `/开关公告通知`。
+
 #237 新增图片二维码检测（pyzbar + Pillow）——检测图片中是否包含 QR 码，命中即撤回+禁言；
 独立开关 `qr_check_enabled`（默认关），可按群覆盖；依赖 pyzbar + Pillow（requirements.txt
 已声明，缺失时静默跳过）。新增 `_check_qr_code` 方法接入检测链路；配置项

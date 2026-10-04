@@ -1391,6 +1391,10 @@ class GroupAdminPlugin(Star):
             ok = await self._api._execute_action(event, "send_group_notice",
                                             group_id=group_id, content=content)
         if ok:
+            # #233：公告发布后按配置发送群内通知提醒成员查看
+            if self._store.get_group_setting(group_id, "announce_notify", True):
+                await self._api._send(event, self._mp._build_text(
+                    f"📢 管理员已发布群公告，请各位成员注意查看"))
             yield event.plain_result("群公告已发布")
         else:
             # 退化为普通消息提示
@@ -2144,6 +2148,11 @@ class GroupAdminPlugin(Star):
     @filter.command("开关踢人清历史", "开关踢人时自动撤回消息（on/off，按群生效）")
     async def toggle_kick_recall_cmd(self, event: AstrMessageEvent, value: str = ""):
         async for r in self._toggle_body(event, value, "kick_recall_enabled", "踢人清历史"):
+            yield r
+
+    @filter.command("开关公告通知", "开关发群公告后发送群内提醒（on/off，按群生效）")
+    async def toggle_announce_notify_cmd(self, event: AstrMessageEvent, value: str = ""):
+        async for r in self._toggle_body(event, value, "announce_notify", "公告通知"):
             yield r
 
     @filter.command("开关二维码检测", "开关图片二维码检测（on/off，按群生效）")

@@ -191,23 +191,24 @@
 | 49 | `group_promotion_exists_check` | bool | `true` |
 | 50 | `group_promotion_exists_cache_ttl` | int | `21600` |
 | 51 | `ban_duration` | int | `600` |
-| 50 | `whitelist_users` | list | `[]` |
-| 51 | `qr_check_enabled` | bool | `false` |
-| 52 | `qr_ban_duration` | int | `600` |
-| 53 | `banned_images` | list | `[]` |
-| 54 | `banned_image_files` | file | `[]` |
-| 55 | `admin_bypass` | bool | `true` |
-| 54 | `notify_on_violation` | bool | `true` |
-| 55 | `max_message_history` | int | `50` |
-| 56 | `kick_recall_enabled` | bool | `false` |
-| 57 | `kick_recall_count` | int | `10` |
-| 58 | `voice_check_enabled` | bool | `false` |
-| 59 | `voice_check_provider_id` | string | `""` |
-| 60 | `voice_asr_endpoint` | string | `""` |
-| 61 | `voice_asr_api_key` | string | `""` |
-| 62 | `voice_asr_model` | string | `""` |
-| 63 | `voice_check_timeout` | int | `15` |
-| 64 | `invite_auto_approve` | bool | `true` |
+| 52 | `whitelist_users` | list | `[]` |
+| 53 | `qr_check_enabled` | bool | `false` |
+| 54 | `qr_ban_duration` | int | `600` |
+| 55 | `announce_notify` | bool | `true` |
+| 56 | `banned_images` | list | `[]` |
+| 57 | `banned_image_files` | file | `[]` |
+| 58 | `admin_bypass` | bool | `true` |
+| 59 | `notify_on_violation` | bool | `true` |
+| 60 | `max_message_history` | int | `50` |
+| 61 | `kick_recall_enabled` | bool | `false` |
+| 62 | `kick_recall_count` | int | `10` |
+| 63 | `voice_check_enabled` | bool | `false` |
+| 64 | `voice_check_provider_id` | string | `""` |
+| 65 | `voice_asr_endpoint` | string | `""` |
+| 66 | `voice_asr_api_key` | string | `""` |
+| 67 | `voice_asr_model` | string | `""` |
+| 68 | `voice_check_timeout` | int | `15` |
+| 69 | `invite_auto_approve` | bool | `true` |
 
 ## 4. 数据文件路径与 data_dir 推导
 

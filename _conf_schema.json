@@ -360,6 +360,12 @@
         "hint": "推荐按群覆盖。",
         "default": 600
     },
+    "announce_notify": {
+        "description": "发布群公告后发送群内通知提醒成员查看",
+        "type": "bool",
+        "hint": "推荐按群覆盖。默认开。",
+        "default": true
+    },
     "banned_images": {
         "description": "违禁图片 MD5 列表（按 MD5 比对）",
         "type": "list",

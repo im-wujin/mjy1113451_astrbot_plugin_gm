@@ -317,6 +317,18 @@
         "hint": "推荐按群覆盖。",
         "default": 600
     },
+    "group_promotion_exists_check": {
+        "description": "群号推广检测时验证群号是否存在（GET p.qlogo.cn 头像比对本地 0.png）",
+        "type": "bool",
+        "hint": "开启后仅对真实存在的群号触发撤回+禁言；不存在的群号（头像与 0.png 一致）会被放行。可按群覆盖。",
+        "default": true
+    },
+    "group_promotion_exists_cache_ttl": {
+        "description": "群号存在性探测结果缓存有效期（秒）",
+        "type": "int",
+        "hint": "可按群覆盖；设为 0 则每次都重新探测（无缓存）。默认 21600 秒（6 小时）。",
+        "default": 21600
+    },
     "ban_duration": {
         "description": "图片违规禁言时长（秒）",
         "type": "int",

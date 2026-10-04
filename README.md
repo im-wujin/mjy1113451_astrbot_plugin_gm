@@ -145,7 +145,7 @@
 | 骂人 | AI 识别（`profanity_use_ai=true` 默认）或关键词匹配双模式，关键词可动态增删；AI 判定时可按严重程度分级禁言（`profanity_ban_duration_severity`，#243） | 开 |
 | 广告 | 预设 24 个常见广告关键词（加群 / 加微信 / 代练 / 外挂 / 刷钻等），可动态增删 | 开 |
 | 链接 | 匹配 http/https/www 等链接格式 | 关（`link_check_enabled`） |
-| 群号推广 | 推广关键词（进群 / 加群 / 群号 / 入群 / 拉群 / 建群）+ 识别 5-12 位群号 | 开 |
+| 群号推广 | 推广关键词（进群 / 加群 / 群号 / 入群 / 拉群 / 建群）+ 识别 5-12 位群号；额外验证群号是否存在（GET p.qlogo.cn 头像与本地 0.png 比对 MD5），不存在的群号放行 | 开（`group_promotion_exists_check`，默认开） |
 
 > 白名单用户（`whitelist_users`）不受检测限制；管理员默认豁免（`admin_bypass`）；检测到违规后可选择群内通知（`notify_on_violation`）。
 

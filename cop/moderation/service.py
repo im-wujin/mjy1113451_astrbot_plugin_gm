@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     from ..permissions import PermissionService
     from ..runtime import RuntimeState
     from ..stats import StatsService
+    from .group_exists import GroupExistsProbe
     from .image import ImageModeration
     from .text import TextModeration
     from .voice import VoiceModeration
@@ -51,6 +52,7 @@ class ModerationService:
         text_moderation: "TextModeration",
         image_moderation: "ImageModeration",
         voice_moderation: "VoiceModeration",
+        group_exists_probe: "GroupExistsProbe",
     ):
         self._store = config_store
         self.config = config_store.config
@@ -62,6 +64,7 @@ class ModerationService:
         self._text = text_moderation
         self._image = image_moderation
         self._voice = voice_moderation
+        self._group_exists = group_exists_probe
 
     # ===================== 群违规检测开关 / 豁免 =====================
 
@@ -232,6 +235,15 @@ class ModerationService:
                 await self._handle_violation(event, "link", group_id, user_id, mid)
                 return True
             if await self._text._check_group_promotion(msg_text, event, group_id, user_id):
+                # #267：群号推广检测增强——仅关键词+格式命中不够，需进一步验证群号是否真实存在
+                group_numbers = self._text._extract_promotion_group_numbers(msg_text)
+                if group_numbers:
+                    # 只探测第一个群号（与原正则 findall 一致，以第一个提取的群号为代表）
+                    exists = await self._group_exists.check_group_exists(
+                        group_numbers[0], group_id)
+                    # None = 网络异常/无法判定，保守跳过（不误撤回误禁言）；False = 群号不存在，放行
+                    if exists is not True:
+                        return False
                 mid = str(raw.get("message_id", "")) if isinstance(raw, dict) else ""
                 await self._handle_violation(event, "group_promotion", group_id, user_id, mid)
                 return True
@@ -266,6 +278,13 @@ class ModerationService:
                     violated_kind = "link"
                 elif await self._text._check_group_promotion(text, event, group_id, user_id):
                     violated_kind = "group_promotion"
+                    # #267：语音群号推广同样需验证群号存在性
+                    group_numbers = self._text._extract_promotion_group_numbers(text)
+                    if group_numbers:
+                        exists = await self._group_exists.check_group_exists(
+                            group_numbers[0], group_id)
+                        if exists is not True:
+                            violated_kind = None
                 if violated_kind:
                     mid = str(raw.get("message_id", "")) if isinstance(raw, dict) else ""
                     await self._handle_violation(event, f"voice_{violated_kind}", group_id, user_id, mid,

@@ -4,7 +4,7 @@
     _check_spam / _check_political / _collect_profanity_keywords
     _check_profanity / _check_profanity_with_ai / _normalize_severity
     _check_ad / _normalize_host / _is_link_whitelisted / _check_link
-    _check_group_promotion
+    _check_group_promotion / _extract_promotion_group_numbers
 
 依赖（构造注入，L3b 只依赖 L0/L1/L2，不 import 同层）：
 - ConfigStore（L1）：config / get_group_setting
@@ -273,16 +273,26 @@ class TextModeration:
         pattern = r"(https?://[^\s]+|www\.[^\s]+\.[^\s]+|[^\s]+\.(com|cn|net|org|io|xyz|top|vip|cc|me|tv|edu|gov)[^\s]*)"
         return re.search(pattern, msg_text, re.IGNORECASE) is not None
 
-    async def _check_group_promotion(self, msg_text: str, event, group_id: str, user_id: str) -> bool:
-        if not self._store.get_group_setting(group_id, "group_promotion_check_enabled", True):
-            return False
+    @staticmethod
+    def _extract_promotion_group_numbers(msg_text: str) -> list[str]:
+        """从文本中提取推广群号列表（5-12 位数字），不判定存在性。
+
+        与 `_check_group_promotion` 共用同一套关键词 + 正则，便于后续统一维护。
+        调用方负责判断是否需要进一步探测群号存在性。
+        """
         if not msg_text:
-            return False
+            return []
         promotion_keywords = ["进群", "加群", "群号", "入群", "拉群", "建群"]
         if not any(kw in msg_text for kw in promotion_keywords):
-            return False
+            return []
         group_pattern = r"[;；:,，\s]*(\d{5,12})"
-        return bool(re.findall(group_pattern, msg_text))
+        return re.findall(group_pattern, msg_text)
+
+    async def _check_group_promotion(self, msg_text: str, event, group_id: str, user_id: str) -> bool:
+        """检测群号推广（仅关键词+格式，不探测存在性；存在性由 ModerationService 补充）。"""
+        if not self._store.get_group_setting(group_id, "group_promotion_check_enabled", True):
+            return False
+        return bool(self._extract_promotion_group_numbers(msg_text))
 
 
 __all__ = ["TextModeration"]

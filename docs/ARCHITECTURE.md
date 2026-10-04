@@ -170,6 +170,7 @@ graph TD
 | [`moderation/image.py`](../cop/moderation/image.py) | `ImageModeration` | 图片 AI 视觉审核 |
 | [`moderation/text.py`](../cop/moderation/text.py) | `TextModeration` | 文本类违规检测（骂人 / 广告 / 链接 / 群号推广等） |
 | [`moderation/voice.py`](../cop/moderation/voice.py) | `VoiceModeration` | 语音转文字违规检测 |
+| [`moderation/group_exists.py`](../cop/moderation/group_exists.py) | `GroupExistsProbe` | QQ 群号存在性探测（p.qlogo.cn 头像 MD5 vs 本地 0.png + 进程内 TTL 缓存） |
 | [`conversational.py`](../cop/conversational.py) | `ColloquialService` | 口语化群管指令意图识别与处理（#254） |
 | [`conversational.py`](../cop/conversational.py) | `DupFaceService` | 重复表情包自动撤回（#196） |
 | [`join_review.py`](../cop/join_review.py) | `JoinReviewService` | 入群欢迎、加群请求自动审核、引用回复审批 |

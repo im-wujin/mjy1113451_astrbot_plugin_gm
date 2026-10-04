@@ -1,3 +1,11 @@
+#267 新增加群号推广存在性验证（GET p.qlogo.cn 头像 MD5 比对腾讯默认群头像固定值
+185ff6f0cfc14f3bb8b838288d7dcc3c）——命中关键词+格式的群号推广消息需进一步验证群号是否
+真实存在，不存在的群号放行；可按群覆盖开关 `group_promotion_exists_check`（默认开）与
+缓存 TTL `group_promotion_exists_cache_ttl`（默认 6 小时）；aiohttp 缺失/网络异常/无法
+判定时保守放行，不误撤回误禁言。新增 cop/moderation/group_exists.py（GroupExistsProbe）
+与 cop/constants.py 探测常量；`_check_group_promotion` 抽出 `_extract_promotion_group_numbers`
+供 service.py 共用；语音检测链路同步接入存在性验证。无需附带默认头像图片文件。
+
 0.01 新增已知功能(禁言，踢人，头衔等)
 
 0.02-0.04 修复了已知问题，并添加了一些新功能

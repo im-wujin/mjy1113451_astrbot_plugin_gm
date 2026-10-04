@@ -188,7 +188,9 @@
 | 46 | `blacklisted_users` | list | `[]` |
 | 47 | `group_promotion_check_enabled` | bool | `true` |
 | 48 | `group_promotion_ban_duration` | int | `600` |
-| 49 | `ban_duration` | int | `600` |
+| 49 | `group_promotion_exists_check` | bool | `true` |
+| 50 | `group_promotion_exists_cache_ttl` | int | `21600` |
+| 51 | `ban_duration` | int | `600` |
 | 50 | `whitelist_users` | list | `[]` |
 | 51 | `banned_images` | list | `[]` |
 | 52 | `banned_image_files` | file | `[]` |

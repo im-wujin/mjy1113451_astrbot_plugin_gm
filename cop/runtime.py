@@ -44,3 +44,7 @@ class RuntimeState:
         # #184：WebUI 上传违禁图片文件的 MD5 缓存
         # {相对路径: md5}；未命中缓存的路径在运行时懒计算并回填。
         self._banned_file_md5_cache: dict = {}
+
+        # 群号存在性探测缓存（#267）：group_exists_cache[群号] -> (exists: bool, timestamp: float)
+        # 仅内存，进程重启清空（探测结果有时效，不做持久化）。
+        self.group_exists_cache: dict = {}

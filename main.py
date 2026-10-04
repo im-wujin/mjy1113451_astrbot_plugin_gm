@@ -38,6 +38,7 @@ try:
     from .cop.stats import StatsService
     from .cop.messaging import MessagingService
     from .cop.moderation import (
+        GroupExistsProbe,
         ModerationService,
         ImageModeration,
         TextModeration,
@@ -69,6 +70,7 @@ except ImportError:  # 兜底：插件目录本身在 sys.path 上时的绝对�
     from cop.stats import StatsService
     from cop.messaging import MessagingService
     from cop.moderation import (
+        GroupExistsProbe,
         ModerationService,
         ImageModeration,
         TextModeration,
@@ -213,6 +215,10 @@ class GroupAdminPlugin(Star):
             config_store=self._store,
             context=self.context,
         )
+        self._mod_group_exists = GroupExistsProbe(
+            config_store=self._store,
+            runtime=self._runtime,
+        )
         self._moderation = ModerationService(
             config_store=self._store,
             onebot_api=self._api,
@@ -223,6 +229,7 @@ class GroupAdminPlugin(Star):
             text_moderation=self._mod_text,
             image_moderation=self._mod_image,
             voice_moderation=self._mod_voice,
+            group_exists_probe=self._mod_group_exists,
         )
         self._colloquial = ColloquialService(
             config_store=self._store,
@@ -267,6 +274,7 @@ class GroupAdminPlugin(Star):
     _dup_face_seen = _runtime_prop("_dup_face_seen")
     _dup_face_last_mid = _runtime_prop("_dup_face_last_mid")
     _banned_file_md5_cache = _runtime_prop("_banned_file_md5_cache")
+    group_exists_cache = _runtime_prop("group_exists_cache")
 
     # ===================== 通用 IO（阶段1：委托 cop 存储层） =====================
     # 仅保留 load_json 作为 cop 存储层委托（仍被门面内部读写明文 JSON 使用）。

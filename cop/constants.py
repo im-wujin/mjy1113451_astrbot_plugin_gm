@@ -18,6 +18,15 @@ _DEFAULT_PROFANITY_PROMPT = (
 # 故单独存 data/plugin_data/group_admin/runtime.json（见 _load_runtime_maps）
 _RUNTIME_MAP_KEYS = ("group_overrides", "groups", "pending_join_requests")
 
+# 群号存在性校验（群头像比对）：
+# GET {template} 对存在的群返回该群真实头像，对不存在的群返回腾讯默认群头像；
+# 默认头像与插件根目录自带的 0.png 内容一致，故用响应体 MD5 与 0.png 的 MD5 比对判定。
+_GROUP_AVATAR_URL_TEMPLATE = "https://p.qlogo.cn/gh/{group_id}/{group_id}/0"
+# 腾讯不存在的群号默认群头像 MD5（p.qlogo.cn 对不存在群号返回的固定图片）
+_GROUP_DEFAULT_AVATAR_MD5 = "185ff6f0cfc14f3bb8b838288d7dcc3c"
+_GROUP_EXISTS_CACHE_TTL = 21600  # 默认缓存 6 小时（秒）
+_GROUP_EXISTS_TIMEOUT = 10  # 单次头像探测超时（秒）
+
 # #254：禁用/踢人/设管理口语化指令所需的时长解析与语义常量
 _CN_DIGITS = {
     "零": 0, "〇": 0, "一": 1, "壹": 1, "二": 2, "两": 2, "俩": 2, "贰": 2,

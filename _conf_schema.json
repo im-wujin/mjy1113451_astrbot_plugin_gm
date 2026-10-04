@@ -329,6 +329,12 @@
         "hint": "可按群覆盖；设为 0 则每次都重新探测（无缓存）。默认 21600 秒（6 小时）。",
         "default": 21600
     },
+    "invite_auto_approve": {
+        "description": "群员邀请进群自动通过（受加群审核总开关 join_audit_enabled 与启用群范围 enabled_groups 控制）",
+        "type": "bool",
+        "hint": "推荐按群覆盖。默认开。",
+        "default": true
+    },
     "ban_duration": {
         "description": "图片违规禁言时长（秒）",
         "type": "int",

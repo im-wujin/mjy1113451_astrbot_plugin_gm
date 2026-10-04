@@ -207,6 +207,7 @@
 | 61 | `voice_asr_api_key` | string | `""` |
 | 62 | `voice_asr_model` | string | `""` |
 | 63 | `voice_check_timeout` | int | `15` |
+| 64 | `invite_auto_approve` | bool | `true` |
 
 ## 4. 数据文件路径与 data_dir 推导
 

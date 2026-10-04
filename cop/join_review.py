@@ -122,6 +122,17 @@ class JoinReviewService:
             )
             return
 
+        # #241：群员邀请（invite）自动通过；黑名单在邀请场景同样拦截（见上方）
+        if str(raw.get("sub_type") or "add") == "invite":
+            auto_approve_invite = bool(
+                self._store.get_group_setting(group_id, "invite_auto_approve", True))
+            if auto_approve_invite:
+                handled = await self._api._handle_group_request(
+                    event, flag, True, "邀请入群自动通过", sub_type="invite")
+                logger.info(f"[加群审核] 群 {group_id} 邀请申请 {user_id} 自动同意: "
+                            f"{'成功' if handled else '失败（协议端）'}")
+                return
+
         # 拒绝理由（#129 使用自定义拒绝理由；#159 优化提示）；#229 关键词自动拒绝复用同一理由
         reject_reason = self._store.get_group_setting(group_id, "join_reject_reason", "不满足加群条件") or "不满足加群条件"
 

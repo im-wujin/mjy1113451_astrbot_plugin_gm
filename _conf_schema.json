@@ -342,6 +342,18 @@
         "hint": "推荐按群覆盖。",
         "default": []
     },
+    "qr_check_enabled": {
+        "description": "启用图片二维码检测（检测图片中是否包含 QR 码，命中即撤回+禁言）",
+        "type": "bool",
+        "hint": "推荐按群覆盖。依赖 Pillow + pyzbar（pip install Pillow pyzbar）。默认关。",
+        "default": false
+    },
+    "qr_ban_duration": {
+        "description": "二维码违规禁言时长（秒）",
+        "type": "int",
+        "hint": "推荐按群覆盖。",
+        "default": 600
+    },
     "banned_images": {
         "description": "违禁图片 MD5 列表（按 MD5 比对）",
         "type": "list",

@@ -121,12 +121,13 @@ class ModerationService:
             "ad": "ad_ban_duration",
             "link": "link_ban_duration",
             "group_promotion": "group_promotion_ban_duration",
+            "qr_code": "qr_ban_duration",
         }
         key = key_map.get(kind, "ban_duration")
         default_map = {
             "image": 600, "spam": 600, "profanity": 600,
             "ad": 600, "link": 600, "group_promotion": 600,
-            "banned_image": 600,
+            "banned_image": 600, "qr_code": 600,
         }
         if severity and key == "profanity_ban_duration" \
                 and self._store.get_group_setting(group_id, "profanity_severity_enabled", True):
@@ -176,7 +177,7 @@ class ModerationService:
             label_map = {
                 "image": "违规图片", "spam": "刷屏", "profanity": "骂人",
                 "ad": "广告", "link": "链接", "group_promotion": "群号推广",
-                "banned_image": "违禁图片",
+                "banned_image": "违禁图片", "qr_code": "二维码",
             }
             label = label_map.get(kind, "违规")
             note = f"检测到{label}行为"
@@ -260,6 +261,12 @@ class ModerationService:
                 # #260：命中记录可诊断日志（含群号/用户/消息ID/原因），便于区分 AI 误判
                 logger.info(f"[群违规检测] 群 {group_id} 用户 {user_id} 图片违规(消息 {mid}): {reason}")
                 await self._handle_violation(event, "image", group_id, user_id, mid, reason)
+                return True
+        # #237：二维码检测（独立于 AI 鉴图，不受 ai_check 开关控制）
+        for url in image_urls:
+            if await self._image._check_qr_code(url, group_id):
+                mid = str(raw.get("message_id", "")) if isinstance(raw, dict) else ""
+                await self._handle_violation(event, "qr_code", group_id, user_id, mid)
                 return True
         # 4) 语音转文字检测（#128）
         if self._store.get_group_setting(group_id, "voice_check_enabled", False):

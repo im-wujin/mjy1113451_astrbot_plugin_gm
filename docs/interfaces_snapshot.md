@@ -192,9 +192,11 @@
 | 50 | `group_promotion_exists_cache_ttl` | int | `21600` |
 | 51 | `ban_duration` | int | `600` |
 | 50 | `whitelist_users` | list | `[]` |
-| 51 | `banned_images` | list | `[]` |
-| 52 | `banned_image_files` | file | `[]` |
-| 53 | `admin_bypass` | bool | `true` |
+| 51 | `qr_check_enabled` | bool | `false` |
+| 52 | `qr_ban_duration` | int | `600` |
+| 53 | `banned_images` | list | `[]` |
+| 54 | `banned_image_files` | file | `[]` |
+| 55 | `admin_bypass` | bool | `true` |
 | 54 | `notify_on_violation` | bool | `true` |
 | 55 | `max_message_history` | int | `50` |
 | 56 | `kick_recall_enabled` | bool | `false` |

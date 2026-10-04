@@ -1,17 +1,18 @@
-"""L3b 群违规检测子域：图片检测（MD5 违禁图 + AI 鉴图）。
+"""L3b 群违规检测子域：图片检测（MD5 违禁图 + AI 鉴图 + 二维码检测）。
 
 迁出自 main.py 的以下方法（逐字保留逻辑等价）：
     _collect_image_urls / _check_banned_image / _banned_image_file_paths
     _get_banned_file_md5s / _compute_image_md5 / _check_image
     _check_with_openai_vision / _parse_openai_response / _check_with_moderation_api
-    _download_image
+    _download_image / _check_qr_code
 
 依赖（构造注入，L3b 只依赖 L0/L1/L2，不 import 同层）：
 - ConfigStore（L1）：config / get_group_setting / data_dir
 - OneBotApi（L2）：无直接调用（保留以对齐注入约定）
 - RuntimeState（L2）：_banned_file_md5_cache
 
-延迟导入约束：本模块使用 compat 提供的模块级 aiohttp（与原 main 模块级导入等价）。
+延迟导入约束：本模块使用 compat 提供的模块级 aiohttp（与原 main 模块级导入等价）；
+Pillow / pyzbar 在 _check_qr_code 内做函数级延迟导入，模块顶层不引入硬依赖。
 """
 
 from __future__ import annotations
@@ -283,6 +284,40 @@ class ImageModeration:
         except Exception as e:
             logger.error(f"[群违规检测] 下载图片失败: {e}")
         return None, False
+
+    async def _check_qr_code(self, image_url: str, group_id: str) -> bool:
+        """#237：检测图片中是否包含 QR 码。有则返回 True，无则返回 False。
+
+        依赖 Pillow + pyzbar（Pillow 读图片为 PIL Image，pyzbar 解码），均为函数级延迟
+        导入——requirements.txt 已声明但模块顶层不硬依赖，缺失时静默返回 False。
+        """
+        if not self._store.get_group_setting(group_id, "qr_check_enabled", False):
+            return False
+        try:
+            from io import BytesIO
+            import numpy as np  # type: ignore
+            from PIL import Image  # type: ignore
+            from pyzbar.pyzbar import decode as pyzbar_decode  # type: ignore
+        except ImportError:
+            logger.warning("[群违规检测] Pillow 或 pyzbar 未安装，跳过二维码检测")
+            return False
+        image_data, truncated = await self._download_image(image_url)
+        if not image_data:
+            return False
+        try:
+            img = Image.open(BytesIO(image_data))
+            # 转换为灰度图（L 模式）以提升 pyzbar 识别率
+            if img.mode not in ("L", "1"):
+                img = img.convert("L")
+            decoded = pyzbar_decode(img)
+            has_qr = any(d.type == "QRCODE" for d in decoded)
+            if has_qr:
+                logger.info(f"[群违规检测] 群 {group_id} 图片检测到二维码，内容: "
+                            f"{[d.data.decode('utf-8','ignore')[:50] for d in decoded]}")
+            return has_qr
+        except Exception as e:
+            logger.error(f"[群违规检测] 二维码检测失败 {image_url}: {e}")
+            return False
 
 
 __all__ = ["ImageModeration"]

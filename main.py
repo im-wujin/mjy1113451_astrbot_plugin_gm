@@ -2146,6 +2146,11 @@ class GroupAdminPlugin(Star):
         async for r in self._toggle_body(event, value, "kick_recall_enabled", "踢人清历史"):
             yield r
 
+    @filter.command("开关二维码检测", "开关图片二维码检测（on/off，按群生效）")
+    async def toggle_qr_check_cmd(self, event: AstrMessageEvent, value: str = ""):
+        async for r in self._toggle_body(event, value, "qr_check_enabled", "二维码检测"):
+            yield r
+
     @filter.command("开关语音检测", "开关语音消息转文字违规检测（on/off，按群生效）")
     async def toggle_voice_check_cmd(self, event: AstrMessageEvent, value: str = ""):
         async for r in self._toggle_body(event, value, "voice_check_enabled", "语音检测"):

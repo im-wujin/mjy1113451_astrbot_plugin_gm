@@ -6,6 +6,11 @@
 与 cop/constants.py 探测常量；`_check_group_promotion` 抽出 `_extract_promotion_group_numbers`
 供 service.py 共用；语音检测链路同步接入存在性验证。无需附带默认头像图片文件。
 
+#237 新增图片二维码检测（pyzbar + Pillow）——检测图片中是否包含 QR 码，命中即撤回+禁言；
+独立开关 `qr_check_enabled`（默认关），可按群覆盖；依赖 pyzbar + Pillow（requirements.txt
+已声明，缺失时静默跳过）。新增 `_check_qr_code` 方法接入检测链路；配置项
+`qr_ban_duration` 控制禁言时长；指令 `/开关二维码检测`。
+
 0.01 新增已知功能(禁言，踢人，头衔等)
 
 0.02-0.04 修复了已知问题，并添加了一些新功能

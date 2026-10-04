@@ -496,6 +496,35 @@ class OneBotApi:
                 return str(m.get("user_id", ""))
         return ""
 
+    @staticmethod
+    def _extract_message_id(result) -> str:
+        """从 send 类 action 响应中提取 message_id（#265）。
+
+        aiocqhttp 的 call_action 成功时直接返回 data 本身（send_group_msg 即
+        `{"message_id": 123}`），部分框架再包一层 `{"status": "ok", "data": {...}}`，
+        少数实现把 message_id 作为裸值返回。#258 只认「带 data 子字典」一种形态，
+        发送成功却提取不到 message_id，于是被当成失败并回退 `_send`，
+        导致同一段群通知被发送两次。
+        """
+        if result is None or isinstance(result, bool):
+            return ""
+        if isinstance(result, (int, str)):
+            return str(result).strip()
+        if isinstance(result, dict):
+            for key in ("message_id", "messageId"):
+                val = result.get(key)
+                if val is not None and str(val).strip():
+                    return str(val).strip()
+            data = result.get("data")
+            if isinstance(data, dict):
+                for key in ("message_id", "messageId"):
+                    val = data.get(key)
+                    if val is not None and str(val).strip():
+                        return str(val).strip()
+            elif isinstance(data, (int, str)) and not isinstance(data, bool) and str(data).strip():
+                return str(data).strip()
+        return ""
+
     async def _send_group_text(self, event: AstrMessageEvent, group_id: str, text: str):
         """向指定群发送纯文本消息，返回 message_id（用于后续引用回复关联）。
 
@@ -504,23 +533,31 @@ class OneBotApi:
         加群申请通知的 message_id 记不进待处理表，管理员引用回复 /同意 时
         永远查不到记录。这里改为优先走 OneBot send_group_msg（event.bot 直调），
         从响应 data.message_id 拿真实消息 ID。
+
+        #265：修复「发送成功但 message_id 提取失败后继续回退发送」造成
+        【新人加群】通知等群通知重复发送两次的问题——只要判定发送成功，
+        无论能否取到 message_id 都立即返回，不再进入任何回退通路。
         """
         raw = await self._call_onebot_raw(event, "send_group_msg",
                                           group_id=str(group_id), message=text)
         if self._action_result_success(raw):
-            data = raw.get("data") if isinstance(raw, dict) else None
-            if isinstance(data, dict) and data.get("message_id"):
-                return str(data["message_id"])
-            if isinstance(data, (int, str)) and str(data):
-                return str(data)
-            # set 类 action 成功但没回 message_id：消息已发出，仍按空串处理
+            mid = self._extract_message_id(raw)
+            if mid:
+                return mid
+            # 消息已成功发出：拿不到 message_id 时只能返回空串（由调用方按被引用
+            # 消息内容兜底定位），绝不能再次发送，否则同一段文本会重复发送（#265）
             logger.warning("[加群审核] send_group_msg 成功但未返回 message_id")
+            return ""
+        # 仅在首次发送确实失败时，才尝试其它通路
         try:
             if hasattr(self.context, "send_group_msg"):
                 result = await self.context.send_group_msg(group_id=int(group_id), message=text)
-                if isinstance(result, dict):
-                    return str(result.get("message_id") or result.get("data", {}).get("message_id", ""))
-                return str(result) if result else ""
+                mid = self._extract_message_id(result)
+                if mid:
+                    return mid
+                if self._action_result_success(result):
+                    logger.warning("[加群审核] context.send_group_msg 成功但未返回 message_id")
+                    return ""
         except Exception as e:
             logger.error(f"发送群消息失败: {e}")
         # 回退：使用 _send 但拿不到 message_id

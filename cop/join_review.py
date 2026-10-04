@@ -1,0 +1,248 @@
+"""L3b 加群审核域（#27 合并 group_manager + #57 引用回复审批）。
+
+迁出自 main.py 的以下逻辑（逐字保留逻辑等价）：
+    on_group_event 中的「入群欢迎」「加群请求自动审核」分支
+    加群申请引用回复处理（#57，原 on_group_message 尾部代码块）
+
+对外方法：
+    _handle_group_increase_notice(event, raw)          —— 入群欢迎（notice.group_increase）
+    _handle_group_join_request(event, raw)             —— 加群请求自动审核（request.group）
+    _handle_group_request_reply(event, raw, gid, uid, reply_id) —— 引用回复同意/拒绝/拉黑
+
+依赖（构造注入，L3b 只依赖 L0/L1/L2，不 import 同层）：
+- ConfigStore（L1）：config / runtime_map / get_group_setting / get_group_override_list
+  / save_config
+- OneBotApi（L2）：_handle_group_request / _notify_admins / _send_group_text
+  / _get_user_nickname
+- RuntimeState（L2）：保留注入（pending_join_requests 经 ConfigStore.runtime_map 访问）
+- PermissionService（L2）：_is_authorized
+- MessageParser（L2）：_extract_text
+- context：AstrBot Context（get_stranger_info，取 QQ 等级 #189）
+
+enabled_groups 语义（与 moderation 不同，逐字保留本处原语义）：
+    经 get_group_setting 合并按群覆盖；bool 直接采用；空列表回退旧 violation_enabled_groups，
+    两者皆空 = 全群启用；非空列表按 * / all / 群号命中判定。
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .config_store import ConfigStore
+    from .message_parse import MessageParser
+    from .onebot_api import OneBotApi
+    from .permissions import PermissionService
+    from .runtime import RuntimeState
+
+
+class JoinReviewService:
+    """加群审核与入群欢迎领域服务。"""
+
+    def __init__(
+        self,
+        *,
+        config_store: "ConfigStore",
+        onebot_api: "OneBotApi",
+        runtime: "RuntimeState",
+        permissions: "PermissionService",
+        message_parse: "MessageParser",
+        context=None,
+    ):
+        self._store = config_store
+        self.config = config_store.config
+        self._api = onebot_api
+        self._runtime = runtime
+        self._perms = permissions
+        self._mp = message_parse
+        self.context = context
+
+    async def _handle_group_increase_notice(self, event, raw: dict):
+        """入群欢迎（原 on_group_event 的 notice.group_increase 分支）。"""
+        group_id = str(raw.get("group_id"))
+        welcome_conf = self._store.runtime_map("groups").get(group_id, {})
+        if welcome_conf.get("welcome_enabled", False):
+            welcome = welcome_conf.get("welcome_message", "欢迎 {at} 加入本群！")
+            content = welcome.replace("{at}", f"@{raw.get('user_id')}")
+            await self._api._send(event, self._mp._build_text(content))
+
+    async def _handle_group_join_request(self, event, raw: dict):
+        """加群请求处理（#27 合并 group_manager）。为 async generator（yield 审批结果）。"""
+        group_id = str(raw.get("group_id"))
+        user_id = str(raw.get("user_id"))
+        flag = raw.get("flag", "")
+        comment = raw.get("comment", "")
+        # #155：审核总开关关闭后，全部自动审核逻辑都跳过
+        audit_enabled = bool(self._store.get_group_setting(group_id, "join_audit_enabled", True))
+        if not audit_enabled:
+            return
+        enabled_groups = self._store.get_group_setting(group_id, "enabled_groups", [])
+        violation_keywords = self._store.get_group_setting(group_id, "violation_keywords", [])
+        join_approve_keywords = self._store.get_group_setting(group_id, "join_approve_keywords", [])
+        # #192 owner：留空 = 全群启用；迁移兼容：新列表为空回退旧 violation_enabled_groups；
+        # 按群覆盖 bool 最高优先（可对单群显式关）
+        if isinstance(enabled_groups, bool):
+            enabled = enabled_groups
+        elif not enabled_groups:
+            legacy_groups = self.config.get("violation_enabled_groups", []) or []
+            if legacy_groups:
+                enabled = group_id in [str(x) for x in legacy_groups]
+            else:
+                enabled = True
+        else:
+            sx_list = [str(x).lower() for x in enabled_groups]
+            enabled = ("*" in sx_list or "all" in sx_list
+                       or group_id in [str(x) for x in enabled_groups])
+
+        # #194：黑名单用户直接拒绝（无需检查关键词/门禁）
+        bl_list = self._store.get_group_setting(group_id, "blacklisted_users", [])
+        if bl_list and str(user_id) in [str(x) for x in bl_list]:
+            handled = await self._api._handle_group_request(event, flag, False, "黑名单用户")
+            yield event.plain_result(
+                f"已拒绝 {user_id} 的加群申请（黑名单用户）" if handled else
+                f"拒绝 {user_id} 的加群申请失败（协议端拒绝或接口不可用，详见日志）")
+            if not handled:
+                return
+            await self._api._notify_admins(
+                f"[加群请求] 已拒绝 {user_id}（群 {group_id}）\n"
+                f"验证消息: {comment}\n"
+                f"原因: 黑名单用户",
+                group_id=group_id,
+            )
+            return
+
+        # 命中违禁词：拒绝 + 通知管理员（#129 使用自定义拒绝理由；#159 优化提示）
+        reject_reason = self._store.get_group_setting(group_id, "join_reject_reason", "不满足加群条件") or "不满足加群条件"
+        if enabled and violation_keywords and any(kw in comment for kw in violation_keywords):
+            detail_reason = f"您的加群申请有词触碰到本群违禁词，自动拒绝（{reject_reason}）"
+            handled = await self._api._handle_group_request(event, flag, False, detail_reason)
+            yield event.plain_result(
+                f"已拒绝 {user_id} 的加群申请（含违禁词）" if handled else
+                f"拒绝 {user_id} 的加群申请失败（协议端拒绝或接口不可用，详见日志）")
+            if not handled:
+                return
+            await self._api._notify_admins(
+                f"[加群请求] 已拒绝 {user_id}（群 {group_id}）\n"
+                f"验证消息: {comment}\n"
+                f"原因: 命中违禁词",
+                group_id=group_id,
+            )
+            return
+
+        # 命中关键词：同意 + 通知管理员 + 群内通知（#186）
+        if enabled and join_approve_keywords and any(kw in comment for kw in join_approve_keywords):
+            handled = await self._api._handle_group_request(event, flag, True, "命中关键词自动同意")
+            yield event.plain_result(
+                f"已同意 {user_id} 的加群申请（命中关键词）" if handled else
+                f"同意 {user_id} 的加群申请失败（协议端拒绝或接口不可用，详见日志）")
+            if not handled:
+                return
+            # #205：全局开关关闭时不发申请/审批通知
+            if self.config.get("join_request_notify_enabled", True):
+                await self._api._notify_admins(
+                    f"[加群请求] 已同意 {user_id}（群 {group_id}）\n"
+                    f"验证消息: {comment}\n"
+                    f"原因: 命中关键词",
+                    group_id=group_id,
+                )
+            # #186：命中加群审核通过关键词后，在该群发送通知
+            await self._api._send_group_text(
+                event, group_id,
+                f"该用户触碰到加群审核通过词语，已自动同意！",
+            )
+            return
+
+        # 群内提醒（#57）：发送申请消息到对应群聊，等待管理员引用回复同意/拒绝
+        if self._store.get_group_setting(group_id, "join_request_notify_in_group", False):
+            nickname = await self._api._get_user_nickname(event, user_id)
+            # #189：补充 QQ 等级（get_stranger_info 的 level 字段，协议端不支持时显示未知）
+            level = ""
+            try:
+                handler = getattr(self.context, "get_stranger_info", None)
+                if callable(handler):
+                    info = await handler(user_id=int(user_id))
+                    info_data = info.get("data", info) if isinstance(info, dict) else {}
+                    level = str(info_data.get("level") or "未知")
+            except Exception:
+                level = "未知"
+            notify_text = (
+                f"【新人加群】通知\n"
+                f"用户qq昵称：{nickname}\n"
+                f"用户qq号：{user_id}\n"
+                f"qq等级：{level or '未知'}\n"
+                f"加群验证消息：{comment or '无'}\n"
+                f"回复 /同意 或 /拒绝 或 /拉黑（引用本消息）"
+            )
+            # 暂存 flag 等待引用回复
+            sent_id = await self._api._send_group_text(event, group_id, notify_text)
+            if sent_id:
+                pending = self._store.runtime_map("pending_join_requests")
+                pending[str(sent_id)] = {"flag": flag, "group_id": group_id, "user_id": user_id}
+                self._store.save_config()
+                # #205：全局开关关闭时不发管理员通知
+                if self.config.get("join_request_notify_enabled", True):
+                    await self._api._notify_admins(
+                        f"[加群请求] {user_id} 申请加入群 {group_id}\n"
+                        f"已在群内发送提醒，请管理员引用回复同意/拒绝",
+                        group_id=group_id,
+                    )
+        else:
+            # #226：未开启群内提醒时，全局开关打开也必须通知管理员，
+            # 否则普通加群申请不会有任何通知（旧实现只在此 if 内发送）。
+            if self.config.get("join_request_notify_enabled", True):
+                nickname = await self._api._get_user_nickname(event, user_id)
+                await self._api._notify_admins(
+                    f"[加群请求] {nickname}（{user_id}）申请加入群 {group_id}\n"
+                    f"验证消息: {comment or '无'}\n"
+                    f"可用 /加群申请待处理 查看，或在群内开启提醒后引用回复同意/拒绝",
+                    group_id=group_id,
+                )
+
+    async def _handle_group_request_reply(self, event, raw: dict, group_id: str, user_id: str, reply_id):
+        """加群申请引用回复处理（#57，原 on_group_message 尾部代码块）。
+
+        为 async generator：命中并处理后 yield 结果；未命中不 yield。
+        """
+        has_permission = self._perms._is_authorized(raw, user_id)
+        if not (reply_id and has_permission):
+            return
+        pending = self._store.runtime_map("pending_join_requests")
+        info = pending.get(str(reply_id))
+        if not info:
+            return
+        msg_text = self._mp._extract_text(raw)
+        if not msg_text:
+            return
+        approve = "同意" in msg_text
+        deny = "拒绝" in msg_text
+        blacklist = "拉黑" in msg_text
+        if not (approve or deny or blacklist):
+            return
+        # #129: 拒绝时支持自定义理由；#194: 拉黑 = 拒绝 + 加入群黑名单
+        reject_reason = "管理员审核"
+        if blacklist:
+            reject_reason = "拉黑"
+            bl_list = self._store.get_group_override_list(group_id, "blacklisted_users")
+            if info["user_id"] not in [str(x) for x in bl_list]:
+                bl_list.append(info["user_id"])
+        elif deny:
+            parts = msg_text.split("拒绝", 1)
+            custom = parts[1].strip() if len(parts) > 1 else ""
+            reject_reason = custom if custom else self._store.get_group_setting(
+                group_id, "join_reject_reason", "不满足加群条件") or "不满足加群条件"
+        # #228：接口调用失败时不能回复"已同意/已拒绝"
+        handled = await self._api._handle_group_request(
+            event, info["flag"], approve, reject_reason)
+        result = "拉黑" if blacklist else ("同意" if approve else "拒绝")
+        if not handled:
+            yield event.plain_result(
+                f"处理 {info['user_id']} 的加群申请失败（协议端拒绝或接口不可用，"
+                f"详见日志），请稍后重试")
+            return
+        # 清理已处理的记录
+        del pending[str(reply_id)]
+        self._store.save_config()
+        yield event.plain_result(f"已{result} {info['user_id']} 的加群申请")
+
+
+__all__ = ["JoinReviewService"]

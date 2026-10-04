@@ -1,0 +1,267 @@
+"""L1 配置存储层：运行时映射 + 全局配置的读写与按群覆盖。
+
+迁出自 main.py 原第 319-551 行。ConfigStore 持有：
+    (config, runtime_path, data_dir, config_path, stats_path, reports_path, lock, json_store)
+
+设计说明：
+- 通过构造注入 JsonStore（L4 门面负责组装），避免 L1 内部同层互相 import。
+- 可依赖 L0：从 constants 取 _RUNTIME_MAP_KEYS，从 text_utils 取 _parse_qq_list。
+- 原 main.py 中的方法体逻辑逐字保留（含异常兜底、注释语义），仅参数名从 self.xxx 改为存储字段。
+"""
+
+import json
+
+from pathlib import Path
+
+from astrbot.api import logger
+
+from .constants import _RUNTIME_MAP_KEYS
+from .text_utils import _parse_qq_list
+
+
+class ConfigStore:
+    """无状态（相对于插件类）的配置/运行时映射存储。"""
+
+    def __init__(
+        self,
+        *,
+        config,
+        runtime_path: Path,
+        data_dir: Path,
+        config_path: Path,
+        stats_path: Path,
+        reports_path: Path,
+        lock,
+        json_store,
+    ):
+        self.config = config
+        self.runtime_path = runtime_path
+        self.data_dir = data_dir
+        self.config_path = config_path
+        self.stats_path = stats_path
+        self.reports_path = reports_path
+        self._lock = lock
+        self._json = json_store
+        # 运行时动态映射（group_overrides / groups / pending_join_requests）
+        self._runtime_maps: dict = self.load_runtime_maps()
+
+    # ===================== 通用 IO（委托 JsonStore） =====================
+
+    def load_json(self, path: Path, default):
+        return self._json.load_json(path, default)
+
+    def save_json(self, path: Path, data):
+        return self._json.save_json(path, data)
+
+    # ===================== 运行时映射 =====================
+
+    @property
+    def runtime_maps(self) -> dict:
+        """对外暴露运行时映射字典本体（门面直接复用同一对象）。"""
+        return self._runtime_maps
+
+    @runtime_maps.setter
+    def runtime_maps(self, value: dict) -> None:
+        self._runtime_maps = value
+
+    @staticmethod
+    def extract_runtime_maps(source, target: dict) -> dict:
+        """把 source 中属于运行时映射的键（dict 类型）合并进 target 并返回。"""
+        if isinstance(source, dict):
+            for key in _RUNTIME_MAP_KEYS:
+                value = source.get(key)
+                if isinstance(value, dict):
+                    target[key] = value
+        return target
+
+    def load_runtime_maps(self) -> dict:
+        """加载运行时动态映射（group_overrides / groups / pending_join_requests）。
+
+        这些映射以群号 / 消息ID 为键、由群内指令动态增删，**不能**放进框架配置：
+        AstrBotConfig 加载时会调用 check_config_integrity，把未在 _conf_schema.json
+        声明的子键判为冗余并删除（内存与磁盘文件一起被清空）。
+        因此单独存 data/plugin_data/group_admin/runtime.json。
+
+        首次升级若不存在 runtime.json，则从旧版 config.json 迁移一次，并把旧文件
+        备份为 .migrated.bak，避免过期数据在下次启动时反覆盖新数据。
+        """
+        # 迁移旧版 过几个版本记得删除
+        maps = {key: {} for key in _RUNTIME_MAP_KEYS}
+        if self.runtime_path.exists():
+            return self.extract_runtime_maps(self.load_json(self.runtime_path, {}), maps)
+
+        maps = self.extract_runtime_maps(self.load_json(self.config_path, {}), maps)
+        self.save_json(self.runtime_path, maps)
+        if self.config_path.exists():
+            try:
+                self.config_path.rename(
+                    self.config_path.with_name(self.config_path.name + ".migrated.bak")
+                )
+                logger.info(
+                    "[群管插件] 已把旧版 config.json 的运行时配置迁移到 runtime.json。"
+                )
+            except Exception as e:
+                logger.error(f"备份旧配置文件失败: {e}")
+        return maps
+
+    def runtime_map(self, key: str) -> dict:
+        """取运行时动态映射（缺键时懒创建）；改动后需调用 save_config() 落盘。"""
+        value = self._runtime_maps.get(key)
+        if not isinstance(value, dict):
+            value = {}
+            self._runtime_maps[key] = value
+        return value
+
+    def save_config(self) -> None:
+        """保存配置（两个存储目标，缺一不可）。
+
+        - 运行时动态映射（group_overrides / groups / pending_join_requests）→ runtime.json，
+          原子写入见 save_json()；
+        - 其余全局键 → 官方 AstrBotConfig.save_config()，与 WebUI 共用
+          data/config/<插件>_config.json，重载/重启后依然生效。
+
+        说明：框架在加载带 _conf_schema.json 的插件时必定以 config=<AstrBotConfig>
+        注入（star_manager 中 AstrBotConfig(config_path=..., schema=...)），故直接调用
+        官方接口，不再做「无 save_config() 时另存本地文件」的假落盘分支。
+        """
+        with self._lock:
+            self.save_json(self.runtime_path, self._runtime_maps)
+            self.config.save_config()
+
+    def mutate_group_list(self, group_id: str, key: str, op: str, value: str) -> tuple:
+        """群 list 配置的原子读-改-写（review#192 race-condition）。
+
+        取列表→增/删→落盘 全程在 _CFG_LOCK 内串行化，避免并发覆盖丢失更新；
+        返回 (ok, 当前列表拷贝)。
+        """
+        with self._lock:
+            lst = self.get_group_override_list(group_id, key)
+            if op == "add":
+                if any(str(x) == value for x in lst):
+                    return False, list(lst)
+                lst.append(value)
+            else:
+                target = next((x for x in list(lst) if str(x) == value), None)
+                if target is None:
+                    return False, list(lst)
+                lst.remove(target)
+            self.save_config()
+            return True, list(lst)
+
+    # ===================== stats / reports =====================
+
+    def save_stats(self, stats) -> None:
+        self.save_json(self.stats_path, stats)
+
+    def save_reports(self, reports) -> None:
+        self.save_json(self.reports_path, reports)
+
+    # ===================== 配置读取 =====================
+
+    def config_list(self, key: str) -> list:
+        """读取配置中的列表项，统一兜底「键缺失 / 值为 None / 类型错误」→ 空列表。"""
+        value = self.config.get(key)
+        return value if isinstance(value, list) else []
+
+    def warn_if_group_scope_empty(self) -> None:
+        """启动告警：群范围类列表留空 = 在【全部群】生效（#192 语义变更）。
+
+        `enabled_groups` 留空（且无历史 `violation_enabled_groups`）时，违规检测会在
+        所有群开启；`auto_recall_enabled_groups` 留空时，Bot 发言自动撤回同样全群生效。
+        这两点容易踩坑，故每次启动提示一次（最多两条，不会刷屏）。
+        """
+        enabled_groups = self.config_list("enabled_groups")
+        legacy_violation_groups = self.config_list("violation_enabled_groups")
+        auto_recall_groups = self.config_list("auto_recall_enabled_groups")
+
+        if not enabled_groups and not legacy_violation_groups:
+            logger.warning(
+                "[IMPORTANT][群管插件] enabled_groups 为空：按 #192 新语义，违规检测"
+                "（含刷屏/图片AI等）将在【全部群】启用。如需限定范围，请配置 "
+                "enabled_groups 列表，或通过 group_overrides 将指定群 enabled_groups 设为 false。"
+            )
+        if not auto_recall_groups:
+            logger.warning(
+                "[IMPORTANT][群管插件] auto_recall_enabled_groups 为空：按 #192 新语义，"
+                "Bot 发言自动撤回将在【全部群】生效（命中 auto_recall_keywords 时）。"
+                "如需限定范围，请配置该列表。"
+            )
+
+    def get_group_setting(self, group_id: str, key: str, default=None):
+        """按群读取配置项，先查 group_overrides[群号][key]，否则用全局配置/默认值。"""
+        overrides = self.runtime_map("group_overrides").get(str(group_id), {})
+        if key in overrides:
+            return overrides[key]
+        return self.config.get(key, default)
+
+    # ===================== 按群覆盖读写 =====================
+
+    def get_group_override_list(self, group_id: str, key: str) -> list:
+        # review#192 race-condition：setdefault 首次创建也加锁，
+        # 避免并发首建同 (group_id,key) 产生多个空 list 互相覆盖；RLock 可重入
+        with self._lock:
+            overrides = self.runtime_map("group_overrides")
+            gconf = overrides.setdefault(str(group_id), {})
+            value = gconf.setdefault(key, [])
+            if not isinstance(value, list):
+                value = [value] if value else []
+                gconf[key] = value
+            return value
+
+    def set_group_override(self, group_id: str, key: str, value) -> None:
+        """按群覆盖写入单个配置项并持久化（#192 owner：管理指令直接按群生效）。"""
+        with self._lock:
+            overrides = self.runtime_map("group_overrides")
+            overrides.setdefault(str(group_id), {})[key] = value
+            self.save_config()
+
+    def add_group_override_admins(self, group_id: str, key: str, qq_list: list) -> list:
+        with self._lock:
+            admins = self.get_group_override_list(group_id, key)
+            added = []
+            for qq in qq_list:
+                qq = str(qq)
+                if qq and qq not in [str(x) for x in admins]:
+                    admins.append(qq)
+                    added.append(qq)
+            if added:
+                self.save_config()
+            return added
+
+    def remove_group_override_admins(self, group_id: str, key: str, qq_list: list) -> list:
+        with self._lock:
+            admins = self.get_group_override_list(group_id, key)
+            removed = []
+            for qq in qq_list:
+                qq = str(qq)
+                for item in list(admins):
+                    if str(item) == qq:
+                        admins.remove(item)
+                        removed.append(qq)
+                        break
+            if removed:
+                self.save_config()
+            return removed
+
+    def normalize_qq_list_value(self, value) -> list:
+        """把 WebUI / 配置里各种写法的名单值归一化为 QQ 字符串列表。
+
+        兼容：list（正常）、JSON 数组字符串（WebUI dict 编辑器里填 ["10001"]）、
+        逗号/空格/顿号分隔的数字串（10001,10002），以及单个 QQ 号。
+        """
+        if value is None:
+            return []
+        if isinstance(value, (list, tuple)):
+            return [str(x).strip() for x in value if str(x).strip()]
+        text = str(value).strip()
+        if not text:
+            return []
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, list):
+                return [str(x).strip() for x in parsed if str(x).strip()]
+            if isinstance(parsed, (str, int)):
+                text = str(parsed)
+        except (ValueError, TypeError):
+            pass
+        return _parse_qq_list(text)

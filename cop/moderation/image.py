@@ -1,0 +1,288 @@
+"""L3b 群违规检测子域：图片检测（MD5 违禁图 + AI 鉴图）。
+
+迁出自 main.py 的以下方法（逐字保留逻辑等价）：
+    _collect_image_urls / _check_banned_image / _banned_image_file_paths
+    _get_banned_file_md5s / _compute_image_md5 / _check_image
+    _check_with_openai_vision / _parse_openai_response / _check_with_moderation_api
+    _download_image
+
+依赖（构造注入，L3b 只依赖 L0/L1/L2，不 import 同层）：
+- ConfigStore（L1）：config / get_group_setting / data_dir
+- OneBotApi（L2）：无直接调用（保留以对齐注入约定）
+- RuntimeState（L2）：_banned_file_md5_cache
+
+延迟导入约束：本模块使用 compat 提供的模块级 aiohttp（与原 main 模块级导入等价）。
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import re
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+from astrbot.api import logger
+
+from ..compat import aiohttp
+
+if TYPE_CHECKING:
+    from ..config_store import ConfigStore
+    from ..onebot_api import OneBotApi
+    from ..runtime import RuntimeState
+
+
+class ImageModeration:
+    """图片违规检测领域服务。"""
+
+    def __init__(
+        self,
+        *,
+        config_store: "ConfigStore",
+        onebot_api: "OneBotApi",
+        runtime: "RuntimeState",
+    ):
+        self._store = config_store
+        self.config = config_store.config
+        self._api = onebot_api
+        self._runtime = runtime
+
+    # ===================== 图片检测 =====================
+
+    def _collect_image_urls(self, raw) -> list:
+        urls = []
+        if not isinstance(raw, dict):
+            return urls
+        for seg in raw.get("message", []) or []:
+            if isinstance(seg, dict) and seg.get("type") == "image":
+                data = seg.get("data", {}) or {}
+                u = data.get("url") or data.get("file") or ""
+                if u and u not in urls:
+                    urls.append(u)
+        return urls
+
+    async def _check_banned_image(self, image_url: str, group_id: str) -> bool:
+        """#162：检查图片 MD5 是否在全局/本群违禁图列表中。
+
+        仅快速预筛原图二次传播；截断或下载失败一律视为未命中（放行），
+        不阻塞后续 AI 鉴图链路。
+        """
+        image_data, truncated = await self._download_image(image_url)
+        if truncated or not image_data:
+            return False
+        md5 = hashlib.md5(image_data).hexdigest()
+        global_banned = set(self.config.get("banned_images", []) or [])
+        group_banned = set(self._store.get_group_setting(group_id, "banned_images", []) or [])
+        banned_md5s = global_banned | group_banned
+        # #184：把 WebUI 上传的图片文件（file 类型）计算 MD5 一并纳入比对
+        banned_md5s |= self._get_banned_file_md5s()
+        return md5 in banned_md5s
+
+    def _banned_image_file_paths(self) -> list:
+        """返回 WebUI 上传的违禁图片文件的绝对路径（data/plugin_data/<plugin>/files/...）。"""
+        rel_paths = self.config.get("banned_image_files", []) or []
+        # 插件数据根：self.data_dir = <plugin_data>/<plugin>/group_admin，其 parent 即 <plugin_data>/<plugin>
+        try:
+            data_root = Path(self._store.data_dir).resolve().parent
+        except Exception:
+            data_root = None
+        result = []
+        for rel in rel_paths:
+            rel_str = str(rel).replace("\\", "/").lstrip("/")
+            if not rel_str or ".." in rel_str.split("/"):
+                continue
+            if data_root is None:
+                continue
+            p = (data_root / rel_str).resolve()
+            try:
+                p.relative_to(data_root)
+            except ValueError:
+                continue
+            if p.is_file():
+                result.append(p)
+        return result
+
+    def _get_banned_file_md5s(self) -> set:
+        """计算 WebUI 上传违禁图片的 MD5（懒计算 + 缓存，失败跳过）。"""
+        md5s = set()
+        for p in self._banned_image_file_paths():
+            rel_str = p.as_posix()
+            if rel_str in self._runtime._banned_file_md5_cache:
+                md5s.add(self._runtime._banned_file_md5_cache[rel_str])
+                continue
+            try:
+                digest = hashlib.md5(p.read_bytes()).hexdigest()
+                self._runtime._banned_file_md5_cache[rel_str] = digest
+                md5s.add(digest)
+            except Exception as e:
+                logger.error(f"计算违禁图片文件 MD5 失败 {p}: {e}")
+        return md5s
+
+    async def _compute_image_md5(self, image_url: str):
+        """下载图片并计算 MD5，供 /添加违禁图片 使用。
+
+        返回 (md5: str|None, truncated: bool)。下载失败返回 (None, False)；
+        图片超过 10MB 时返回 (None, True)，调用方应提示用户图片过大。
+        """
+        image_data, truncated = await self._download_image(image_url)
+        if not image_data:
+            return None, truncated
+        return hashlib.md5(image_data).hexdigest(), truncated
+
+    async def _check_image(self, image_url: str):
+        """调用 AI API 审核图片。返回 (is_violation, reason)。"""
+        if aiohttp is None:
+            logger.warning("[群违规检测] aiohttp 未安装，跳过图片审核")
+            return False, ""
+        api_endpoint = self.config.get("api_endpoint", "")
+        api_key = self.config.get("api_key", "")
+        api_type = self.config.get("api_type", "openai_vision")
+        if not api_endpoint:
+            return False, ""
+        try:
+            image_data, _truncated = await self._download_image(image_url)
+            if not image_data:
+                return False, ""
+            image_b64 = base64.b64encode(image_data).decode("utf-8")
+            if api_type == "moderation":
+                return await self._check_with_moderation_api(api_endpoint, api_key, image_b64)
+            return await self._check_with_openai_vision(api_endpoint, api_key, image_b64)
+        except Exception as e:
+            logger.error(f"[群违规检测] 图片审核失败: {e}")
+            return False, ""
+
+    async def _check_with_openai_vision(self, api_endpoint: str, api_key: str, image_b64: str):
+        model_name = self.config.get("model_name", "gpt-4o")
+        prompt = self.config.get("detection_prompt") or (
+            "请分析这张图片，判断是否包含违规内容（色情/擦边等）。"
+            "请仅返回 JSON：{\"is_violation\": true/false, \"type\": \"porn/sexy/normal\", "
+            "\"confidence\": 0.0-1.0, \"reason\": \"简短原因\"}"
+        )
+        payload = {
+            "model": model_name,
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
+            ]}],
+            "max_tokens": 500,
+            "temperature": 0.1,
+        }
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        try:
+            timeout = aiohttp.ClientTimeout(total=60)
+            async with aiohttp.ClientSession() as session:
+                async with session.post(api_endpoint, json=payload, headers=headers, timeout=timeout) as resp:
+                    if resp.status != 200:
+                        text = await resp.text()
+                        logger.error(f"[群违规检测] OpenAI Vision API 失败: {resp.status} {text[:200]}")
+                        return False, ""
+                    data = await resp.json()
+            content = (((data.get("choices") or [{}])[0]).get("message") or {}).get("content", "")
+            return self._parse_openai_response(content)
+        except Exception as e:
+            logger.error(f"[群违规检测] OpenAI Vision 调用失败: {e}")
+            return False, ""
+
+    def _parse_openai_response(self, content: str):
+        if not content:
+            return False, ""
+        try:
+            content = content.strip()
+            if content.startswith("```"):
+                lines = content.split("\n")
+                content = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
+            match = re.search(r"\{[^{}]*\}", content, re.DOTALL)
+            text = match.group() if match else content
+            data = json.loads(text)
+            is_violation = bool(data.get("is_violation", False))
+            v_type = str(data.get("type", "normal")).lower()
+            try:
+                confidence = float(data.get("confidence", 0))
+            except (TypeError, ValueError):
+                confidence = 0.0
+            reason = str(data.get("reason", ""))
+            threshold = float(self.config.get("threshold", 0.7) or 0.7)
+            check_porn = bool(self.config.get("check_porn", True))
+            check_sexy = bool(self.config.get("check_sexy", True))
+            if is_violation and confidence >= threshold:
+                if v_type == "porn" and check_porn:
+                    return True, f"检测到色情内容 (置信度: {confidence:.0%}) - {reason}"
+                if v_type == "sexy" and check_sexy:
+                    return True, f"检测到擦边内容 (置信度: {confidence:.0%}) - {reason}"
+            return False, ""
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.error(f"[群违规检测] 解析 OpenAI 响应失败: {e}")
+            return False, ""
+
+    async def _check_with_moderation_api(self, api_endpoint: str, api_key: str, image_b64: str):
+        payload = {"input": image_b64}
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        try:
+            timeout = aiohttp.ClientTimeout(total=30)
+            async with aiohttp.ClientSession() as session:
+                async with session.post(api_endpoint, json=payload, headers=headers, timeout=timeout) as resp:
+                    if resp.status != 200:
+                        logger.error(f"[群违规检测] Moderation API 失败: {resp.status}")
+                        return False, ""
+                    data = await resp.json()
+            results = data.get("results") or []
+            if not results:
+                return False, ""
+            categories = results[0].get("categories", {}) or {}
+            scores = results[0].get("category_scores", {}) or {}
+            if categories.get("sexual"):
+                return True, f"检测到性内容 (置信度: {scores.get('sexual', 0):.0%})"
+            return False, ""
+        except Exception as e:
+            logger.error(f"[群违规检测] Moderation API 调用失败: {e}")
+            return False, ""
+
+    async def _download_image(self, url: str, max_size: int = 10 * 1024 * 1024):
+        """下载图片。#162 增强：限制最大 10MB，避免慢速/大文件阻塞检测。
+
+        返回 (data, truncated) 元组：truncated=True 表示数据被截断到 max_size+1，
+        调用方（如 /添加违禁图片）应拒绝基于截断数据计算指纹。
+        """
+        if aiohttp is None:
+            return None, False
+        try:
+            if url.startswith("http://") or url.startswith("https://"):
+                timeout = aiohttp.ClientTimeout(total=15)
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url, timeout=timeout) as resp:
+                        if resp.status != 200:
+                            return None, False
+                        # Content-Type 必须为图片
+                        ct = resp.headers.get("Content-Type", "")
+                        if ct and not ct.startswith("image/"):
+                            return None, False
+                        data = await resp.content.read(max_size + 1)
+                        return data, len(data) > max_size
+            elif url.startswith("base64://"):
+                # base64 内嵌数据本身即图片内容，无需 Content-Type 校验
+                data = base64.b64decode(url[9:])
+                truncated = len(data) > max_size
+                return (data[:max_size + 1] if truncated else data), truncated
+            elif url.startswith("file://"):
+                with open(url[7:], "rb") as f:
+                    data = f.read(max_size + 1)
+                    return data, len(data) > max_size
+            elif url and not url.startswith("http"):
+                # 某些实现把图片作为本地路径返回
+                try:
+                    with open(url, "rb") as f:
+                        data = f.read(max_size + 1)
+                        return data, len(data) > max_size
+                except OSError:
+                    return None, False
+        except Exception as e:
+            logger.error(f"[群违规检测] 下载图片失败: {e}")
+        return None, False
+
+
+__all__ = ["ImageModeration"]

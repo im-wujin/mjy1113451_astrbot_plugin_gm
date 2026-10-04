@@ -477,19 +477,38 @@ A: OneBot `delete_msg` 只能撤回约 2 分钟内的消息，超时会静默失
 
 ---
 
-## 目录结构
+## 项目结构
+
+插件采用「门面 + 服务层」分层架构：`main.py` 仅保留 `@register` 类与全部对外接口（`@filter` 命令 / 事件 / 钩子），业务逻辑下沉至插件私有子包 `cop/`（L0-L4 单向依赖、显式依赖注入、无全局单例）。
 
 ```
 astrbot_plugin_gm/
-├── main.py              # 插件主逻辑（3100+ 行）
+├── main.py              # 门面：@register 类 + 全部 @filter 入口（约 2447 行）
 ├── metadata.yaml         # 插件元信息
 ├── _conf_schema.json     # 配置项说明
 ├── README.md             # 本文件
 ├── NOTICE                # 第三方代码声明（astrbot_plugin_group_moderation 移植）
 ├── LICENSE               # AGPL-3.0 License
 ├── requirements.txt      # Python 依赖（aiohttp）
+├── docs/
+│   └── ARCHITECTURE.md   # 架构说明（分层、依赖方向、模块职责、扩展与测试）
+├── cop/                  # 插件私有子包（业务逻辑分层，20 个模块）
+│   ├── compat.py / constants.py / text_utils.py          # L0 基础层
+│   ├── json_store.py / config_store.py                   # L1 存储层
+│   ├── permissions.py / message_parse.py / onebot_api.py / runtime.py  # L2 能力层
+│   ├── history.py / stats.py / messaging.py              # L3a 领域服务
+│   ├── conversational.py                                 # L3b 重复表情包 + 口语化指令
+│   ├── join_review.py                                    # L3b 加群审核
+│   ├── moderation/                                       # L3b 违规检测业务域
+│   └── ...                                               # 其余分层模块
 └── .github/              # GitHub 配置
 ```
+
+> 注：`cop/message_parse.py` 内含 `MessageParser` 与 `TargetResolver`（原 `target_resolver.py` 已并入）；
+> `cop/conversational.py` 内含 `ColloquialService` 与 `DupFaceService`（原 `colloquial.py`、`dup_face.py` 已并入）。
+> 上述均为**物理归并**，对外类名 / 行为 / 分层契约不变。
+
+> 完整目录树、分层依赖图、各模块职责与扩展/测试指引见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)。
 
 ---
 

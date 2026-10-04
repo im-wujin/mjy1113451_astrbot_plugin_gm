@@ -419,6 +419,66 @@ class GroupAdminPlugin(Star):
         listing = "\n".join([f"{i+1}. {kw}" for i, kw in enumerate(kws)])
         yield event.plain_result(f"本群加群审核通过关键词（{len(kws)} 个）：\n{listing}")
 
+    # ===================== 加群自动拒绝关键词（#229，全局配置 + 按群覆盖） =====================
+
+    @filter.command("加群自动拒绝关键词", "加群申请命中关键词自动拒绝并拉黑（添加|删除|查看，按群覆盖）")
+    async def join_reject_keywords_cmd(self, event: AstrMessageEvent, action: str = "", keyword: str = ""):
+        if not await self._perms._moderation_require_admin_msg(event):
+            return
+        group_id = self._mp._get_group_id_or_none(event)
+        if not group_id:
+            yield event.plain_result("此指令只能在群聊中使用")
+            return
+        act = (action or "").strip()
+        kw = (keyword or "").strip()
+        if act in ("添加", "add"):
+            if not kw:
+                yield event.plain_result("[错误] 用法：/加群自动拒绝关键词 添加 <关键词>")
+                return
+            ok, kws = self._store.mutate_group_list(group_id, "join_reject_keywords", "add", kw)
+            if not ok:
+                yield event.plain_result(f"[错误] 关键词 '{kw}' 已在本群列表中（当前 {len(kws)} 个）")
+                return
+            yield event.plain_result(
+                f"[成功] 已添加本群加群自动拒绝关键词 '{kw}'（当前 {len(kws)} 个）\n"
+                f"命中该词的加群申请将被自动拒绝，申请人同时加入本群黑名单")
+            return
+        if act in ("删除", "del", "remove"):
+            if not kw:
+                yield event.plain_result("[错误] 用法：/加群自动拒绝关键词 删除 <关键词>")
+                return
+            ok, kws = self._store.mutate_group_list(group_id, "join_reject_keywords", "remove", kw)
+            if not ok:
+                yield event.plain_result(f"[错误] 关键词 '{kw}' 不在本群列表中（当前 {len(kws)} 个）")
+                return
+            yield event.plain_result(f"[成功] 已删除本群加群自动拒绝关键词 '{kw}'（当前 {len(kws)} 个）")
+            return
+        if act in ("查看", "list", ""):
+            # #229：本群覆盖用运行时原始值判断（不经 get_group_setting 回退），
+            # 以便区分「本群列表」与「全局列表」并说明实际生效来源
+            override = self._store.runtime_map("group_overrides").get(str(group_id), {})
+            group_kws = override.get("join_reject_keywords")
+            group_kws = group_kws if isinstance(group_kws, list) else []
+            global_kws = self.config.get("join_reject_keywords", [])
+            global_kws = global_kws if isinstance(global_kws, list) else []
+            lines = []
+            if group_kws:
+                lines.append(f"本群加群自动拒绝关键词（{len(group_kws)} 个）：")
+                lines.extend([f"  {i+1}. {k}" for i, k in enumerate(group_kws)])
+            if global_kws:
+                lines.append(f"全局加群自动拒绝关键词（{len(global_kws)} 个）：")
+                lines.extend([f"  {i+1}. {k}" for i, k in enumerate(global_kws)])
+            if not lines:
+                yield event.plain_result("本群与全局均未设置加群自动拒绝关键词")
+                return
+            effective = "本群列表" if group_kws else "全局列表"
+            yield event.plain_result(
+                "\n".join(lines) +
+                f"\n当前生效：{effective}（命中即自动拒绝申请，并把申请人加入本群黑名单）")
+            return
+        yield event.plain_result(
+            "用法：/加群自动拒绝关键词 添加 <关键词> | 删除 <关键词> | 查看")
+
     @filter.command("添加白名单用户", "添加白名单用户（不受违规检测限制，按群生效）")
     async def add_whitelist_user_cmd(self, event: AstrMessageEvent, user_id: str = ""):
         if not await self._perms._moderation_require_admin_msg(event):
@@ -2368,20 +2428,10 @@ class GroupAdminPlugin(Star):
             async for _join_result in self._join_review._handle_group_join_request(event, raw):
                 yield _join_result
 
-    @filter.command("新人加群申请通知", "开关新人加群申请通知（on/off，全局配置，#205）")
-    async def toggle_join_request_notify_cmd(self, event: AstrMessageEvent, value: str = ""):
-        if not await self._perms._moderation_require_admin_msg(event):
-            return
-        v = (value or "").strip().lower()
-        if v in ("on", "true", "开", "开启"):
-            enabled = True
-        elif v in ("off", "false", "关", "关闭"):
-            enabled = False
-        else:
-            enabled = not bool(self.config.get("join_request_notify_enabled", True))
-        self.config["join_request_notify_enabled"] = enabled
-        self._store.save_config()
-        yield event.plain_result(f"[成功] 新人加群申请通知已{'开启' if enabled else '关闭'}（全局）")
+    # #229：原 /新人加群申请通知（join_request_notify_enabled，#205 全局开关）已随
+    # 「两项加群通知配置略微重复，删除一项」的清理一并移除。群内提醒开关统一由
+    # /开关加群申请提醒（join_request_notify_in_group，按群生效）负责；如需彻底
+    # 静音，把 join_notify_admins / /查看加群通知QQ 的列表留空即可（无收件人即不发送）。
 
     @filter.after_message_sent()
     async def after_message_sent(self, event: AstrMessageEvent):

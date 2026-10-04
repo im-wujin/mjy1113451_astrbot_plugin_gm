@@ -250,6 +250,11 @@ AstrBot 框架在注册 handler 时，**依据 `handler.__module__` 精确绑定
 - `data_dir` 存在双层嵌套。
 
 > 上述均为**既有行为，本次重构未改动**。
+>
+> 后续变更（#229）：`新人加群申请通知` 指令（`join_request_notify_enabled`，#205）已随配置去重删除，
+> 并新增 `加群自动拒绝关键词`。因此 `GM_COMMAND_NAMES` 现为 **96** 项、`@filter.command` 仍为 **93** 个，
+> 「仅装饰器有」列表仅剩 `开关链接检测`、`重复表情包撤回`（以
+> [`docs/interfaces_snapshot.md`](interfaces_snapshot.md) 为准）。
 
 ---
 

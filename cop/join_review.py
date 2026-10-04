@@ -70,7 +70,12 @@ class JoinReviewService:
             await self._api._send(event, self._mp._build_text(content))
 
     async def _handle_group_join_request(self, event, raw: dict):
-        """加群请求处理（#27 合并 group_manager）。为 async generator（yield 审批结果）。"""
+        """加群请求处理（#27 合并 group_manager）。为 async generator（yield 审批结果）。
+
+        #229：在违禁词判定之前新增「加群自动拒绝关键词」判定
+        （join_reject_keywords：本群覆盖优先、否则用全局列表）——命中即自动拒绝
+        并把申请人加入本群黑名单，此后其再次申请直接命中黑名单分支。
+        """
         group_id = str(raw.get("group_id"))
         user_id = str(raw.get("user_id"))
         flag = raw.get("flag", "")
@@ -117,8 +122,42 @@ class JoinReviewService:
             )
             return
 
-        # 命中违禁词：拒绝 + 通知管理员（#129 使用自定义拒绝理由；#159 优化提示）
+        # 拒绝理由（#129 使用自定义拒绝理由；#159 优化提示）；#229 关键词自动拒绝复用同一理由
         reject_reason = self._store.get_group_setting(group_id, "join_reject_reason", "不满足加群条件") or "不满足加群条件"
+
+        # #229：命中「加群自动拒绝关键词」→ 自动拒绝 + 加入本群黑名单 + 通知管理员
+        # （列表来源：本群覆盖非空优先，否则全局 join_reject_keywords；与违禁词/自动
+        #   同意关键词一致，受加群审核总开关与启用群范围 enabled 控制）
+        reject_keywords = self._store.get_group_setting(group_id, "join_reject_keywords", [])
+        hit_keyword = None
+        if enabled and reject_keywords:
+            for kw in reject_keywords:
+                if str(kw) and str(kw) in comment:
+                    hit_keyword = str(kw)
+                    break
+        if hit_keyword is not None:
+            # 先落黑名单再拒绝：即便协议端拒绝失败（如 flag 过期），后续申请也会被黑名单拦住
+            bl = self._store.get_group_override_list(group_id, "blacklisted_users")
+            if str(user_id) not in [str(x) for x in bl]:
+                bl.append(str(user_id))
+                self._store.save_config()
+            detail_reason = f"您的加群申请含有本群禁止的词语，自动拒绝（{reject_reason}）"
+            handled = await self._api._handle_group_request(
+                event, flag, False, detail_reason, sub_type=sub_type)
+            yield event.plain_result(
+                f"已拒绝 {user_id} 的加群申请（命中自动拒绝关键词「{hit_keyword}」，已加入本群黑名单）" if handled else
+                f"拒绝 {user_id} 的加群申请失败（协议端拒绝或接口不可用，详见日志；该用户已加入本群黑名单）")
+            if not handled:
+                return
+            await self._api._notify_admins(
+                f"[加群请求] 已拒绝 {user_id}（群 {group_id}）\n"
+                f"验证消息: {comment}\n"
+                f"原因: 命中加群自动拒绝关键词「{hit_keyword}」，已加入本群黑名单",
+                group_id=group_id,
+            )
+            return
+
+        # 命中违禁词：拒绝 + 通知管理员（#129 使用自定义拒绝理由；#159 优化提示）
         if enabled and violation_keywords and any(kw in comment for kw in violation_keywords):
             detail_reason = f"您的加群申请有词触碰到本群违禁词，自动拒绝（{reject_reason}）"
             handled = await self._api._handle_group_request(
@@ -145,14 +184,14 @@ class JoinReviewService:
                 f"同意 {user_id} 的加群申请失败（协议端拒绝或接口不可用，详见日志）")
             if not handled:
                 return
-            # #205：全局开关关闭时不发申请/审批通知
-            if self.config.get("join_request_notify_enabled", True):
-                await self._api._notify_admins(
-                    f"[加群请求] 已同意 {user_id}（群 {group_id}）\n"
-                    f"验证消息: {comment}\n"
-                    f"原因: 命中关键词",
-                    group_id=group_id,
-                )
+            # #229：原 join_request_notify_enabled（#205）全局开关已随配置去重移除，
+            # 通知改为始终发送；需要彻底静音时把 join_notify_admins 留空即可
+            await self._api._notify_admins(
+                f"[加群请求] 已同意 {user_id}（群 {group_id}）\n"
+                f"验证消息: {comment}\n"
+                f"原因: 命中关键词",
+                group_id=group_id,
+            )
             # #186：命中加群审核通过关键词后，在该群发送通知
             await self._api._send_group_text(
                 event, group_id,
@@ -194,24 +233,22 @@ class JoinReviewService:
                 logger.warning("[加群审核] 未能获取申请通知的 message_id，"
                                "待处理记录改按 flag 暂存，引用回复时按内容兜底定位")
             self._store.save_config()
-            # #205：全局开关关闭时不发管理员通知
-            if self.config.get("join_request_notify_enabled", True):
-                await self._api._notify_admins(
-                    f"[加群请求] {user_id} 申请加入群 {group_id}\n"
-                    f"已在群内发送提醒，请管理员引用回复同意/拒绝",
-                    group_id=group_id,
-                )
+            # #229：原 join_request_notify_enabled（#205）全局开关已移除，通知改为始终发送
+            await self._api._notify_admins(
+                f"[加群请求] {user_id} 申请加入群 {group_id}\n"
+                f"已在群内发送提醒，请管理员引用回复同意/拒绝",
+                group_id=group_id,
+            )
         else:
-            # #226：未开启群内提醒时，全局开关打开也必须通知管理员，
-            # 否则普通加群申请不会有任何通知（旧实现只在此 if 内发送）。
-            if self.config.get("join_request_notify_enabled", True):
-                nickname = await self._api._get_user_nickname(event, user_id)
-                await self._api._notify_admins(
-                    f"[加群请求] {nickname}（{user_id}）申请加入群 {group_id}\n"
-                    f"验证消息: {comment or '无'}\n"
-                    f"可用 /加群申请待处理 查看，或在群内开启提醒后引用回复同意/拒绝",
-                    group_id=group_id,
-                )
+            # #226：未开启群内提醒时也必须通知管理员，否则普通加群申请不会有任何通知。
+            # #229：随 join_request_notify_enabled 去重移除，这里不再有全局开关判定。
+            nickname = await self._api._get_user_nickname(event, user_id)
+            await self._api._notify_admins(
+                f"[加群请求] {nickname}（{user_id}）申请加入群 {group_id}\n"
+                f"验证消息: {comment or '无'}\n"
+                f"可用 /加群申请待处理 查看，或在群内开启提醒后引用回复同意/拒绝",
+                group_id=group_id,
+            )
 
     async def _handle_group_request_reply(self, event, raw: dict, group_id: str, user_id: str, reply_id):
         """加群申请引用回复处理（#57，原 on_group_message 尾部代码块）。

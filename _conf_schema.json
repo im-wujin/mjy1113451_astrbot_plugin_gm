@@ -69,6 +69,13 @@
         "hint": "推荐按群覆盖：在群内 /设置群配置 join_approve_keywords [关键词列表]。",
         "default": []
     },
+    "join_reject_keywords": {
+        "description": "加群申请验证消息命中后自动拒绝并拉黑申请人的关键词列表（#229，推荐按群覆盖）",
+        "type": "list",
+        "items": {"type": "string"},
+        "hint": "命中任一关键词即自动拒绝该加群申请，并把申请人加入本群黑名单（#194），此后其再申请直接拒绝且不再发群内提醒。本群列表非空时优先于全局；按群维护：/加群自动拒绝关键词 添加 <关键词> | 删除 <关键词> | 查看。与违禁词自动拒绝同样受加群申请自动审核总开关 join_audit_enabled 与启用群范围 enabled_groups 控制。",
+        "default": []
+    },
     "join_notify_admins": {
         "description": "加群请求处理结果通知管理员QQ号列表（推荐按群覆盖）",
         "type": "list",
@@ -81,12 +88,6 @@
         "type": "bool",
         "hint": "推荐按群覆盖：/设置群配置 join_request_notify_in_group true/false。",
         "default": false
-    },
-    "join_request_notify_enabled": {
-        "description": "新人加群申请通知全局开关（#205，默认开启）",
-        "type": "bool",
-        "hint": "关闭后不再向管理员发送加群申请/审批通知（群内提醒仍由 join_request_notify_in_group 按群控制）。指令：/新人加群申请通知 on|off。",
-        "default": true
     },
     "join_reject_reason": {
         "description": "加群申请自动拒绝时的默认理由",

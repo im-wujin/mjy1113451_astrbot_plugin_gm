@@ -46,7 +46,7 @@
 | 34 | `撤回` | 撤回消息（/撤回 + 引用消息 / /撤回 @用户 N / /撤回 N） | — | `recall_cmd` |
 | 35 | `撤回自身` | 撤回机器人最近发送的消息（/撤回自身 N） | — | `recall_self_cmd` |
 | 36 | `改群头像` | 引用图片回复即可修改群头像 | — | `set_group_avatar_cmd` |
-| 37 | `新人加群申请通知` | 开关新人加群申请通知（on/off，全局配置，#205） | — | `toggle_join_request_notify_cmd` |
+| 37 | `加群自动拒绝关键词` | 加群申请命中关键词自动拒绝并拉黑（添加\|删除\|查看，按群覆盖，#229） | — | `join_reject_keywords_cmd` |
 | 38 | `查看举报通知QQ` | 查看本群接收举报通知的管理员QQ列表 | — | `list_report_notify_cmd` |
 | 39 | `查看加群审核通过关键词` | 查看加群审核自动通过关键词列表（本群） | — | `list_join_approve_keywords_cmd` |
 | 40 | `查看加群通知QQ` | 查看本群加群请求通知管理员QQ列表 | — | `list_join_notify_cmd` |
@@ -151,9 +151,9 @@
 | 9 | `report_notify_admins` | list | `[]` |
 | 10 | `rank_top_n` | int | `10` |
 | 11 | `join_approve_keywords` | list | `[]` |
-| 12 | `join_notify_admins` | list | `[]` |
-| 13 | `join_request_notify_in_group` | bool | `false` |
-| 14 | `join_request_notify_enabled` | bool | `true` |
+| 12 | `join_reject_keywords` | list | `[]` |
+| 13 | `join_notify_admins` | list | `[]` |
+| 14 | `join_request_notify_in_group` | bool | `false` |
 | 15 | `join_reject_reason` | string | `"不满足加群条件"` |
 | 16 | `join_audit_enabled` | bool | `true` |
 | 17 | `group_admin_admins_by_group` | dict | `{}` |
@@ -224,8 +224,8 @@ self.reports_path = self.data_dir / "reports.json"   # 举报待处理
 
 ## 5. 校验结论
 
-- `GM_COMMAND_NAMES` 项数：95
-- AST 解析 `@filter.command` 项数：93
+- `GM_COMMAND_NAMES` 项数：96（#229 新增 `加群自动拒绝关键词`）
+- AST 解析 `@filter.command` 项数：93（#229 移除 `新人加群申请通知`、新增 `加群自动拒绝关键词`，总数不变）
 - 仅在 GM_COMMAND_NAMES、不在装饰器：['别人昵称', '改群昵称', '群名称', '群昵称', '设群友昵称']
-- 仅在装饰器、不在 GM_COMMAND_NAMES：['开关链接检测', '新人加群申请通知', '重复表情包撤回']
+- 仅在装饰器、不在 GM_COMMAND_NAMES：['开关链接检测', '重复表情包撤回']
 - 一致：否

@@ -95,6 +95,7 @@
 | `/设置消息历史条数 N` | 本地撤回消息缓存条数（max_message_history，≥10） |
 | `/设置踢人清条数 N` | 踢人撤回消息条数（kick_recall_count，1-50） |
 | `/设置拒绝理由 理由` | 加群自动拒绝理由（join_reject_reason） |
+| `/加群自动拒绝关键词 添加 <词>` / `/删除 <词>` / `/查看` | 加群申请命中关键词即自动拒绝并把申请人拉黑（按群覆盖，全局配置 `join_reject_keywords`，#229） |
 | `/添加自动撤回关键词 词` / `/删除自动撤回关键词 词` / `/查看自动撤回关键词` | 自动撤回关键词（按群） |
 | `/添加举报通知QQ QQ` / `/删除举报通知QQ QQ` / `/查看举报通知QQ` | 举报结果通知管理员（按群） |
 | `/添加加群通知QQ QQ` / `/删除加群通知QQ QQ` / `/查看加群通知QQ` | 加群申请处理结果通知管理员（按群） |
@@ -159,24 +160,30 @@
 
 ### 加群申请自动审核
 
-加群申请验证流程（受总开关 `join_audit_enabled` 控制，关闭后仅保留管理员手动审核）：
+加群申请验证流程（受总开关 `join_audit_enabled` 控制，关闭后仅保留管理员手动审核；黑名单用户始终直接拒绝）：
 
-1. **违禁词自动拒绝**：申请验证消息命中 `violation_keywords` → 自动拒绝，并按 `join_reject_reason` 给出理由
-2. **关键词自动同意**：验证消息命中 `join_approve_keywords` → 自动同意，并在该群发送通知「该用户触碰到加群审核通过词语，已自动同意！」（#186）
-3. **群内提醒人工审核**：`join_request_notify_in_group=true` 时，申请信息发到群内（含昵称/QQ号/QQ等级/验证消息），管理员**引用回复「同意」或「拒绝 [理由]」或「拉黑」**即可完成审核（#189/#194）；回复「拉黑」= 拒绝申请 + 将该用户加入本群黑名单，此后其再次申请自动拒绝
-4. **管理员私聊通知**：处理结果推送给 `join_notify_admins` 列表中的 QQ
+1. **黑名单直接拒绝**：申请人已在 `blacklisted_users`（`/添加黑名单`、引用回复「拉黑」都会写入）→ 直接拒绝，不检查任何关键词（#194）
+2. **自动拒绝关键词并拉黑（#229）**：申请验证消息命中 `join_reject_keywords`（本群列表非空时优先，否则用全局列表）→ 自动拒绝并按 `join_reject_reason` 给出理由，同时**把申请人加入本群黑名单**，此后其再次申请直接命中黑名单分支，且不再发群内提醒
+3. **违禁词自动拒绝**：申请验证消息命中 `violation_keywords` → 自动拒绝，并按 `join_reject_reason` 给出理由
+4. **关键词自动同意**：验证消息命中 `join_approve_keywords` → 自动同意，并在该群发送通知「该用户触碰到加群审核通过词语，已自动同意！」（#186）
+5. **群内提醒人工审核**：`join_request_notify_in_group=true` 时，申请信息发到群内（含昵称/QQ号/QQ等级/验证消息），管理员**引用回复「同意」或「拒绝 [理由]」或「拉黑」**即可完成审核（#189/#194）；回复「拉黑」= 拒绝申请 + 将该用户加入本群黑名单，此后其再次申请自动拒绝
+6. **管理员私聊通知**：处理结果推送给 `join_notify_admins` 列表中的 QQ（列表为空即不通知任何人；#229 起不再有 `join_request_notify_enabled` 全局开关与 `/新人加群申请通知` 指令）
 
 ```
 /加群申请待处理                 # 查看本群未处理的加群申请列表
 /添加加群审核通过关键词 <词>      # 添加关键词（命中自动同意）
 /删除加群审核通过关键词 <词>      # 删除关键词
 /查看加群审核通过关键词           # 查看本群关键词
+/加群自动拒绝关键词 添加 <词>     # 添加自动拒绝关键词（命中即拒绝 + 拉黑，#229）
+/加群自动拒绝关键词 删除 <词>     # 删除自动拒绝关键词
+/加群自动拒绝关键词 查看          # 查看本群/全局列表与当前生效来源
 ```
 
 关键词配置示例（在群内执行）：
 
 ```
 /添加加群审核通过关键词 学生
+/加群自动拒绝关键词 添加 广告
 /设置拒绝理由 请填写真实验证信息
 ```
 
@@ -279,6 +286,7 @@ pip install astrbot_plugin_group_admin
 ```
 
 按群覆盖的可配置 key 包括：基础配置（`show_recall_notice`、`auto_recall_keywords`、`auto_recall_enabled_groups`、`rank_top_n`、`report_notify_admins`、`join_approve_keywords`、`join_notify_admins`、`join_request_notify_in_group`、`enabled_groups`）+ 违规检测全部子项（`spam_*`、`profanity_*`、`ad_*`、`link_*`、`group_promotion_*`、`ban_duration`、`whitelist_users`、`blacklisted_users`（#194）、`admin_bypass`、`notify_on_violation`)+ 权限细分（`mute_kick_threshold`）+ 撤回历史（`max_message_history`）+ 踢人清历史（`kick_recall_enabled`、`kick_recall_count`）+ 语音违规检测开关（`voice_check_enabled`）。
+> 加群自动拒绝关键词（`join_reject_keywords`）支持按群覆盖：群内 `/加群自动拒绝关键词 添加|删除|查看` 维护本群列表，**本群列表非空时优先于全局列表**（#229）。
 > 语音转文字相关配置（`voice_check_provider_id`、`voice_asr_endpoint`、`voice_asr_api_key`、`voice_asr_model`、`voice_check_timeout`）为**全局配置**，不支持按群覆盖。
 > `group_overrides` 为**内部存储项，已从配置项 schema 移除、不在 WebUI 配置页展示**（#192/#219 owner），按群覆盖功能不受影响，仍由各管理指令（禁言时长/关键词/白名单等）维护；实际存储在 `data/plugin_data/group_admin/runtime.json`，需手动修改时请先停止机器人再编辑（运行中会被插件写回覆盖）。
 
@@ -351,6 +359,7 @@ pip install astrbot_plugin_group_admin
 | 能力 | 配置 / 命令 | 说明 |
 |------|------|------|
 | 违禁词自动拒绝 | `enabled_groups` + `violation_keywords` | 命中违禁词自动拒绝（#129）；`enabled_groups` 留空 = 全群启用（#192） |
+| 关键词自动拒绝并拉黑 | `join_reject_keywords` / `/加群自动拒绝关键词 添加 <词>` | 验证消息命中即自动拒绝并把申请人加入本群黑名单（#229），本群列表优先于全局 |
 | 关键词自动同意 | `join_approve_keywords` | 验证消息命中关键词自动同意 |
 | 群内提醒管理员 | `join_request_notify_in_group = true` | 申请消息发送到群内，引用回复同意/拒绝/拉黑（#57/#194） |
 | 自定义拒绝理由 | `join_reject_reason` / 引用回复「拒绝 理由」 | 默认"不满足加群条件"，可按群覆盖 |
